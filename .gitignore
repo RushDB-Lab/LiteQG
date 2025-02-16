@@ -48,3 +48,6 @@ data/*/
 # python
 *.pyc
 __pycache__/
+
+# ann results
+results
