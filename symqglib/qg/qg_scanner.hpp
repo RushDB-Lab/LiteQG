@@ -134,7 +134,7 @@ class QGScanner {
             _mm512_storeu_ps(&result_float[i + 16], f32b);
         }
 #else
-        for (size_t i = 0; i < D; ++i) {
+        for (size_t i = 0; i < degree_bound_; ++i) {
             result_float[i] = static_cast<float>((static_cast<int>(result[i]) << 1) - sumq);
         }
 #endif

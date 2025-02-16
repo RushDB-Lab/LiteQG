@@ -2,8 +2,7 @@ cmake_minimum_required (VERSION 3.10)
 
 project(SymphonyQG LANGUAGES CXX)
 
-set(CXX_STANDARD 17)
-
+set(CMAKE_CXX_STANDARD 17)
 
 # AVX512 or AVX2 required
 include(CheckCXXSourceRuns)
