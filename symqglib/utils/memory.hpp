@@ -5,7 +5,6 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <new>
 
 #include "../utils/tools.hpp"
 
@@ -13,59 +12,72 @@ namespace symqg::memory {
 #define PORTABLE_ALIGN32 __attribute__((aligned(32)))
 #define PORTABLE_ALIGN64 __attribute__((aligned(64)))
 
-template <typename T, size_t Alignment = 64, bool HugePage = false>
+template <typename Type, size_t AlignBytes = 64, bool HugePage = false>
 class AlignedAllocator {
    private:
-    static_assert(Alignment >= alignof(T));
+    static_assert(AlignBytes >= alignof(Type));
 
    public:
-    using value_type = T;
+    using value_type = Type;
+    static std::align_val_t constexpr kAlignment{AlignBytes};
 
-    template <class U>
+    template <class OtherType>
     struct rebind {
-        using other = AlignedAllocator<U, Alignment>;
+        using other = AlignedAllocator<OtherType, AlignBytes>;
     };
 
     constexpr AlignedAllocator() noexcept = default;
 
     constexpr AlignedAllocator(const AlignedAllocator&) noexcept = default;
 
-    template <typename U>
-    constexpr explicit AlignedAllocator(AlignedAllocator<U, Alignment> const&) noexcept {}
+    template <typename OtherType>
+    constexpr explicit AlignedAllocator(AlignedAllocator<
+                                        OtherType,
+                                        AlignBytes> const&) noexcept {}
 
-    [[nodiscard]] T* allocate(std::size_t n) {
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    [[nodiscard]] value_type* allocate(std::size_t elements) {
+        if (elements > std::numeric_limits<std::size_t>::max() / sizeof(value_type)) {
             throw std::bad_array_new_length();
         }
 
-        auto nbytes = round_up_to_multiple(n * sizeof(T), Alignment);
-        auto* ptr = ::operator new[](nbytes, std::align_val_t(Alignment));
+        auto const nbytes = round_up2multiple(
+            elements * sizeof(value_type), static_cast<size_t>(kAlignment)
+        );
+        auto* ptr = ::operator new[](nbytes, kAlignment);
         if (HugePage) {
             madvise(ptr, nbytes, MADV_HUGEPAGE);
         }
-        return reinterpret_cast<T*>(ptr);
+        return reinterpret_cast<value_type*>(ptr);
     }
 
-    void deallocate(T* ptr, [[maybe_unused]] std::size_t bytes) {
-        ::operator delete[](ptr, std::align_val_t(Alignment));
+    void deallocate(value_type* ptr, [[maybe_unused]] std::size_t bytes) {
+        ::operator delete[](ptr, kAlignment);
+    }
+    auto operator!=(const AlignedAllocator& other) {
+        return other.kAlignment != this->kAlignment;
+    }
+    auto operator==(const AlignedAllocator& other) {
+        return other.kAlignment == this->kAlignment;
     }
 };
 
-template <typename T>
+template <typename Type>
 struct Allocator {
    public:
-    using value_type = T;
+    using value_type = Type;
 
     constexpr Allocator() noexcept = default;
 
-    template <typename U>
-    explicit constexpr Allocator(const Allocator<U>&) noexcept {}
+    template <typename OtherType>
+    explicit constexpr Allocator(const Allocator<OtherType>&) noexcept {}
 
-    [[nodiscard]] constexpr T* allocate(std::size_t n) {
-        return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t(alignof(T))));
+    [[nodiscard]] constexpr value_type* allocate(std::size_t n) {
+        return static_cast<value_type*>(
+            ::operator new(n * sizeof(value_type), std::align_val_t(alignof(value_type)))
+        );
     }
 
-    constexpr void deallocate(T* ptr, size_t count) noexcept {
+    constexpr void deallocate(value_type* ptr, size_t count) noexcept {
         ::operator delete(ptr, count);
     }
 
@@ -78,7 +90,7 @@ struct Allocator {
 
 template <size_t Alignment>
 inline void* align_allocate(size_t nbytes, bool huge_page = false) {
-    size_t size = round_up_to_multiple(nbytes, Alignment);
+    size_t size = round_up2multiple(nbytes, Alignment);
     void* ptr = std::aligned_alloc(Alignment, size);
     if (huge_page) {
         madvise(ptr, nbytes, MADV_HUGEPAGE);

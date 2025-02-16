@@ -40,21 +40,17 @@ class HashBasedBooleanSet {
     HashBasedBooleanSet() = default;
 
     HashBasedBooleanSet(const HashBasedBooleanSet& other)
-        : table_size_(other.table_size_)
-        , mask_(other.mask_)
-        , table_(other.table_)
-        , stl_hash_(other.stl_hash_) {}
+        : table_size_(other.table_size_), mask_(other.mask_), table_(other.table_) {}
 
     HashBasedBooleanSet(HashBasedBooleanSet&& other) noexcept
         : table_size_(other.table_size_)
         , mask_(other.mask_)
-        , table_(std::move(other.table_))
-        , stl_hash_(std::move(other.stl_hash_)) {}
+        , table_(std::move(other.table_)) {}
+
     HashBasedBooleanSet& operator=(HashBasedBooleanSet&& other) noexcept {
         table_size_ = other.table_size_;
         mask_ = other.mask_;
         table_ = std::move(other.table_);
-        stl_hash_ = std::move(other.stl_hash_);
 
         return *this;
     }
@@ -75,12 +71,11 @@ class HashBasedBooleanSet {
         mask_ = static_cast<PID>(table_size_ - 1);
         const PID check_val = hash1(static_cast<PID>(table_size));
         if (check_val != 0) {
-            std::cerr << "[WARN] table size is not 2^N :  " << table_size << '\n';
+            std::cerr << "[WARN] table size is not 2^N :  " << table_size << std::endl;
         }
 
         table_ = std::vector<PID, memory::AlignedAllocator<PID>>(table_size);
         std::fill(table_.begin(), table_.end(), kPidMax);
-        stl_hash_.clear();
     }
 
     void clear() {
@@ -90,21 +85,20 @@ class HashBasedBooleanSet {
 
     [[nodiscard]] auto get(PID data_id) const {
         PID val = this->table_[hash1(data_id)];
-        if (val == data_id) {
-            return true;
-        }
-        return (val != kPidMax && stl_hash_.find(data_id) != stl_hash_.end());
+        return (
+            (val == data_id) ||
+            (val != kPidMax && stl_hash_.find(data_id) != stl_hash_.end())
+        );
     }
 
     void set(PID data_id) {
         PID& val = table_[hash1(data_id)];
-        if (val == data_id) {
-            return;
-        }
         if (val == kPidMax) {
             val = data_id;
         } else {
-            stl_hash_.emplace(data_id);
+            if (val != data_id) {
+                stl_hash_.emplace(data_id);
+            }
         }
     }
 };

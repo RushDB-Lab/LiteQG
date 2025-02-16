@@ -101,6 +101,8 @@ class ResultBuffer {
 
     void copy_results(PID* knn) const { std::copy(ids_.begin(), ids_.end() - 1, knn); }
 
+    [[nodiscard]] const size_t& capacity() const { return capacity_; }
+    
    private:
     std::vector<PID, memory::AlignedAllocator<PID>> ids_;
     std::vector<float, memory::AlignedAllocator<float>> distances_;

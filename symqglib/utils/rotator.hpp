@@ -29,16 +29,16 @@ class FHTRotator {
 
     explicit FHTRotator(size_t dim)
         : dimension_(dim)
-        , paded_dim_(1 << ceil_log2(dim))
+        , paded_dim_(1 << log2_roundup(dim))
         , mat_(std::vector<size_t>{1, paded_dim_}) {
-        size_t log_b = ceil_log2(dim);
+        size_t log_b = log2_roundup(dim);
         // log_b = std::max((size_t)6, log_b);  // assert B is a mutiple of 64
 
         std::uniform_int_distribution<int> bernoulli(0, 1);
         std::random_device rdd;
         std::mt19937_64 gen(rdd());
         for (size_t i = 0; i < paded_dim_; ++i) {
-            mat_[i] = static_cast<float>((2 * bernoulli(gen)) - 1) /
+            mat_[i] = static_cast<float>(2 * bernoulli(gen) - 1) /
                       std::sqrt(static_cast<float>(paded_dim_));
         }
 #if defined(__AVX512F__)
@@ -115,6 +115,10 @@ class FHTRotator {
 
     void load(std::ifstream& input) { mat_.load(input); }
 
+    void load(std::istream& input) { mat_.load(input); }
+
     void save(std::ofstream& output) const { mat_.save(output); }
+
+    void save(std::ostream& output) const { mat_.save(output); }
 };
 }  // namespace symqg

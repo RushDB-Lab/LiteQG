@@ -1,9 +1,11 @@
 #pragma once
 
+#include <bits/stdc++.h>
 #include <immintrin.h>
 
-#include <cstddef>
 #include <cstdint>
+
+#include "../common.hpp"
 
 namespace symqg::space {
 
@@ -16,17 +18,24 @@ inline auto popcount(size_t dim, const uint64_t* __restrict__ data) -> size_t {
     return ret;
 }
 
-/* Change 0/1 data to uint64 */
-inline void pack_binary(
-    const int* __restrict__ bin_x, uint64_t* __restrict__ binary, size_t length
-) {
-    for (size_t i = 0; i < length; i += 64) {
-        uint64_t cur = 0;
-        for (size_t j = 0; j < 64; ++j) {
-            cur |= (static_cast<uint64_t>(bin_x[i + j]) << (63 - j));
+/* Change 0/1 mat to uint64 */
+inline void pack_binary(const RowMatrix<int>& bin_x_rotated, uint64_t* binary) {
+    size_t rows = bin_x_rotated.rows();
+    size_t cols = bin_x_rotated.cols();
+
+    for (size_t row = 0; row < rows; ++row) {
+        for (size_t col = 0; col < cols; col += 64) {
+            uint64_t cur = 0;
+            for (size_t i = 0; i < 64; ++i) {
+                cur |=
+                    (static_cast<uint64_t>(
+                         bin_x_rotated(static_cast<long>(row), static_cast<long>(col + i))
+                     )
+                     << (63 - i));
+            }
+            *binary = cur;
+            ++binary;
         }
-        *binary = cur;
-        ++binary;
     }
 }
 
