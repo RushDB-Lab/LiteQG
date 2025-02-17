@@ -56,6 +56,8 @@ class QuantizedGraph {
     HashBasedBooleanSet visited_;
     VisitedListPool visited_list_pool_;
     buffer::SearchBuffer search_pool_;
+    vl_type* visited_array_;
+    vl_type visited_array_tag_;
 
     /*
      * Position of different data in each row
@@ -273,13 +275,13 @@ inline void QuantizedGraph::search_qg(
     std::vector<float> appro_dist(degree_bound_);  // approximate dis
 
     VisitedList *vl = visited_list_pool_.getFreeVisitedList();
-    vl_type* visited_array = vl->mass;
-    vl_type visited_array_tag = vl->curV;
+    visited_array_ = vl->mass;
+    visited_array_tag_ = vl->curV;
 
     while (search_pool_.has_next()) {
         PID cur_node = search_pool_.pop();
-        if (visited_array[cur_node] != visited_array_tag) {
-            visited_array[cur_node] = visited_array_tag;
+        if (visited_array_[cur_node] != visited_array_tag_) {
+            visited_array_[cur_node] = visited_array_tag_;
             float sqr_y = scan_neighbors(
                 q_obj,
                 get_vector(cur_node),
@@ -334,9 +336,10 @@ inline float QuantizedGraph::scan_neighbors(
         std::cout << "Error " << (appro_dist[i] - __gt_dist__) / __gt_dist__ << '\t';
         std::cout << "sqr_y " << sqr_y << '\n';
 #endif
-        if (search_pool.is_full(tmp_dist) || visited_.get(cur_neighbor)) {
+        if (search_pool.is_full(tmp_dist) || visited_array_[cur_neighbor] == visited_array_tag_) {
             continue;
         }
+        visited_array_[cur_neighbor] = visited_array_tag_;
         search_pool.insert(cur_neighbor, tmp_dist);
         memory::mem_prefetch_l2(
             reinterpret_cast<const char*>(get_vector(search_pool.next_id())), 10
@@ -358,8 +361,8 @@ inline void QuantizedGraph::update_results(
         PID* ptr_nb = get_neighbors(data_id);
         for (uint32_t i = 0; i < this->degree_bound_; ++i) {
             PID cur_neighbor = ptr_nb[i];
-            if (!visited_.get(cur_neighbor)) {
-                visited_.set(cur_neighbor);
+            if (visited_array_[cur_neighbor] != visited_array_tag_) {
+                visited_array_[cur_neighbor] = visited_array_tag_;
                 result_pool.insert(
                     cur_neighbor, space::l2_sqr(query, get_vector(cur_neighbor), dimension_)
                 );
