@@ -82,4 +82,60 @@ inline float l2_sqr_single(const float* __restrict__ vec0, size_t dim) {
     return result;
 }
 
+inline float l2_sqr_uint8(const uint8_t* __restrict__ vec0, const uint8_t* __restrict__ vec1, size_t dim) {
+    const uint8_t *pVect1 = vec0;
+    const uint8_t *pVect2 = vec1;
+
+    size_t qty = dim;
+
+    const uint8_t *pEnd1 = pVect1 + qty;
+
+    __m256i v1, v2, v1_256_low, v1_256_high, v2_256_low, v2_256_high;
+    __m256i diff_low, diff_high;
+    __m256i sum256 = _mm256_setzero_si256(); // 初始和设置为零
+
+    while (pVect1 + 32 <= pEnd1) { // 每次处理 32 个 uint8_t
+        // 加载 32 个 uint8_t
+        v1 = _mm256_loadu_si256((const __m256i *) pVect1);
+        v2 = _mm256_loadu_si256((const __m256i *) pVect2);
+
+        // 转换 uint8_t 到 uint16_t，降到 16 个元素
+        v1_256_low = _mm256_unpacklo_epi8(v1, _mm256_setzero_si256());
+        v1_256_high = _mm256_unpackhi_epi8(v1, _mm256_setzero_si256());
+        v2_256_low = _mm256_unpacklo_epi8(v2, _mm256_setzero_si256());
+        v2_256_high = _mm256_unpackhi_epi8(v2, _mm256_setzero_si256());
+
+        // 计算差值
+        diff_low = _mm256_sub_epi16(v1_256_low, v2_256_low);
+        diff_high = _mm256_sub_epi16(v1_256_high, v2_256_high);
+
+        // 使用 madd_epi16 进行平方
+        sum256 = _mm256_add_epi32(sum256, _mm256_madd_epi16(diff_low, diff_low));
+        sum256 = _mm256_add_epi32(sum256, _mm256_madd_epi16(diff_high, diff_high));
+
+        pVect1 += 32; // 加载下一个块
+        pVect2 += 32; // 加载下一个块
+    }
+
+    // 提取结果并计算总和
+    int32_t cTmp[8];
+    _mm256_store_si256((__m256i *) cTmp, sum256);
+
+    // 累加
+    int32_t res = 0;
+    for (int i = 0; i < 8; i++) {
+        res += cTmp[i];
+    }
+
+    // 处理剩余的不足 32 字节的部分
+    while (pVect1 < pEnd1) {
+        int16_t diff = static_cast<int16_t>(*pVect1) - static_cast<int16_t>(*pVect2);
+        res += diff * diff;
+        pVect1++;
+        pVect2++;
+    }
+
+    return static_cast<float>(res);
+}
+
 }  // namespace symqg::space

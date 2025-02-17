@@ -19,6 +19,7 @@
 #include "../utils/rotator.hpp"
 #include "./qg_query.hpp"
 #include "./qg_scanner.hpp"
+#include <queue>
 
 namespace symqg {
 /**
@@ -50,6 +51,18 @@ class QuantizedGraph {
             1 << 22,
             true>>
         data_;  // vectors + graph + quantization codes
+
+    data::Array<
+    uint8_t,
+    std::vector<size_t>,
+    memory::AlignedAllocator<
+        uint8_t,
+        1 << 22,
+        true>>
+    qdata_;  // u8 vectors
+
+    size_t cur_ef_;
+
     QGScanner scanner_;
     FHTRotator rotator_;
     HashBasedBooleanSet visited_;
@@ -81,6 +94,14 @@ class QuantizedGraph {
 
     [[nodiscard]] const float* get_vector(PID data_id) const {
         return &data_.at(row_offset_ * data_id);
+    }
+
+    [[nodiscard]] uint8_t* get_qvector(PID data_id) {
+        return &qdata_.at(dimension_ * data_id);
+    }
+
+    [[nodiscard]] const uint8_t* get_qvector(PID data_id) const {
+        return &qdata_.at(dimension_ * data_id);
     }
 
     [[nodiscard]] uint8_t* get_packed_code(PID data_id) {
@@ -152,6 +173,12 @@ class QuantizedGraph {
     void search(
         const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
     );
+
+    void search_qg_with_heap(
+        const float* __restrict__ query,
+        uint32_t knn,
+        uint32_t* __restrict__ results
+    );
 };
 
 inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t dim)
@@ -173,6 +200,13 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
         float* dst = get_vector(i);
         std::copy(src, src + dimension_, dst);
     }
+    for (size_t i = 0; i < num_points_; ++i) {
+        const float* src = data + (dimension_ * i);
+        uint8_t* dst = get_qvector(i);
+        for (int i = 0; i < dimension_; ++i) {
+            dst[i] = static_cast<uint8_t>(src[i]);
+        }
+    }
     std::cout << "\tVectors Copied\n";
 }
 
@@ -186,6 +220,7 @@ inline void QuantizedGraph::save_index(const char* filename) const {
 
     /* Data */
     data_.save(output);
+    qdata_.save(output);
 
     /* Rotator */
     this->rotator_.save(output);
@@ -221,6 +256,7 @@ inline void QuantizedGraph::load_index(const char* filename) {
 
     /* Data */
     data_.load(input);
+    qdata_.load(input);
 
     /* Rotator */
     this->rotator_.load(input);
@@ -231,6 +267,7 @@ inline void QuantizedGraph::load_index(const char* filename) {
 
 inline void QuantizedGraph::set_ef(size_t cur_ef) {
     this->search_pool_.resize(cur_ef);
+    cur_ef_ = cur_ef;
     this->visited_ = HashBasedBooleanSet(std::min(this->num_points_ / 10, cur_ef * cur_ef));
 }
 
@@ -243,7 +280,8 @@ inline void QuantizedGraph::search(
     /* Init query matrix */
     this->visited_.clear();
     this->search_pool_.clear();
-    search_qg(query, knn, results);
+    // search_qg(query, knn, results);
+    search_qg_with_heap(query, knn, results);
 }
 
 /**
@@ -288,6 +326,98 @@ inline void QuantizedGraph::search_qg(
 
     update_results(res_pool, query);
     res_pool.copy_results(results);
+}
+
+struct CandidateComparator {
+    bool operator()(const Candidate<float>& lhs, const Candidate<float>& rhs) const {
+        return lhs.distance < rhs.distance;  // Min-heap (smallest distance has priority)
+    }
+};
+
+using MaxHeap = std::priority_queue<Candidate<float>,
+                                               std::vector<Candidate<float>>,
+                                               CandidateComparator>;
+
+/**
+ * @brief search on qg
+ *
+ * @param query     unrotated query vector, dimension_ elements
+ * @param rd_query  rotated query vector, padded_dim_ elements
+ * @param knn       num of nearest neighbors
+ * @param results   searh res
+ */
+inline void QuantizedGraph::search_qg_with_heap(
+    const float* __restrict__ query,
+    uint32_t knn,
+    uint32_t* __restrict__ results
+) {
+    /* Variables used for searching */
+    float sqr_y = 0;                       // square of distance from query to centroid
+    PID cur_node = 0;                      // current visiting node in graph
+    uint32_t cur_degree = 0;               // degree of current node in graph
+    PID cur_neighbor = 0;                  // current neighbor
+    const PID* ptr_nb = nullptr;           // ptr of neighbors
+
+    // memory::AlignedAllocator<Candidate<float>> allocator;
+    MaxHeap search_pool;
+    MaxHeap res_pool;
+
+    uint8_t qquery[dimension_];
+    for (int i = 0; i < dimension_; ++i) {
+        qquery[i] = static_cast<uint8_t>(query[i]);
+    }
+
+    cur_node = this->entry_point_;
+    sqr_y = space::l2_sqr_uint8(qquery, get_qvector(cur_node), dimension_);
+    float lowerBound = sqr_y;
+    search_pool.emplace(cur_node, -sqr_y);
+    res_pool.emplace(cur_node, sqr_y);
+    visited_.set(cur_node);
+    
+    while (!search_pool.empty()) {
+        auto &candidate = search_pool.top();
+        cur_node = candidate.id;
+        if (-candidate.distance > lowerBound) {
+            break;
+        }
+        search_pool.pop();
+        
+        ptr_nb = get_neighbors(cur_node);
+        
+        for (uint32_t i = 0; i < cur_degree; ++i) {
+            cur_neighbor = ptr_nb[i];
+            if (!visited_.get(cur_node)) {
+                visited_.set(cur_node);
+                sqr_y = space::l2_sqr_uint8(qquery, get_qvector(cur_neighbor), dimension_);
+                if (res_pool.size() < cur_ef_ || lowerBound > sqr_y) {
+                    search_pool.emplace(cur_neighbor, -sqr_y);
+                    res_pool.emplace(cur_neighbor, sqr_y);
+                    if (res_pool.size() > cur_ef_) {
+                        res_pool.pop();
+                    }
+                    if (!res_pool.empty()) {
+                        lowerBound = res_pool.top().distance;
+                    }
+                }
+            }
+            memory::mem_prefetch_l2(
+                reinterpret_cast<char*>(get_vector(cur_neighbor)), 10
+            );
+        }
+    }
+
+    while (res_pool.size() > knn) {
+        res_pool.pop();
+    }
+
+    for (int i = 0; i < knn; ++i) {
+        if (!res_pool.empty()) {
+            results[i] = res_pool.top().id;
+            res_pool.pop();
+        } else {
+            results[i] = 0;
+        }
+    }
 }
 
 // scan a data row (including data vec and quantization codes for its neighbors)
@@ -381,6 +511,10 @@ inline void QuantizedGraph::initialize() {
         Array<float, std::vector<size_t>, memory::AlignedAllocator<float, 1 << 22, true>>(
             std::vector<size_t>{num_points_, row_offset_}
         );
+    qdata_ = data::
+    Array<uint8_t, std::vector<size_t>, memory::AlignedAllocator<uint8_t, 1 << 22, true>>(
+        std::vector<size_t>{num_points_, dimension_}
+    );
 }
 
 // find candidate neighbors for cur_id, exclude the vertex itself
