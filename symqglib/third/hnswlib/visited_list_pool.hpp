@@ -5,7 +5,7 @@
 #include <deque>
 
 namespace symqg {
-typedef unsigned short int vl_type;
+typedef int vl_type;
 
 class VisitedList {
  public:

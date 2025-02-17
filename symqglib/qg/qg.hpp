@@ -339,7 +339,6 @@ inline float QuantizedGraph::scan_neighbors(
         if (search_pool.is_full(tmp_dist) || visited_array_[cur_neighbor] == visited_array_tag_) {
             continue;
         }
-        visited_array_[cur_neighbor] = visited_array_tag_;
         search_pool.insert(cur_neighbor, tmp_dist);
         memory::mem_prefetch_l2(
             reinterpret_cast<const char*>(get_vector(search_pool.next_id())), 10
