@@ -12,6 +12,7 @@
 #include "../quantization/rabitq.hpp"
 #include "../space/l2.hpp"
 #include "../third/ngt/hashset.hpp"
+#include "../third/hnswlib/visited_list_pool.hpp"
 #include "../third/svs/array.hpp"
 #include "../utils/buffer.hpp"
 #include "../utils/io.hpp"
@@ -53,6 +54,7 @@ class QuantizedGraph {
     QGScanner scanner_;
     FHTRotator rotator_;
     HashBasedBooleanSet visited_;
+    VisitedListPool visited_list_pool_;
     buffer::SearchBuffer search_pool_;
 
     /*
@@ -162,6 +164,7 @@ inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t dim)
     , scanner_(padded_dim_, degree_bound_)
     , rotator_(dimension_)
     , visited_(100)
+    , visited_list_pool_(1, num)
     , search_pool_(0) {
     initialize();
 }
@@ -231,7 +234,7 @@ inline void QuantizedGraph::load_index(const char* filename) {
 
 inline void QuantizedGraph::set_ef(size_t cur_ef) {
     this->search_pool_.resize(cur_ef);
-    this->visited_ = HashBasedBooleanSet(std::min(this->num_points_ / 10, cur_ef * cur_ef));
+    // this->visited_ = HashBasedBooleanSet(std::min(this->num_points_ / 10, cur_ef * cur_ef));
 }
 
 /*
@@ -241,7 +244,7 @@ inline void QuantizedGraph::search(
     const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
 ) {
     /* Init query matrix */
-    this->visited_.clear();
+    // this->visited_.clear();
     this->search_pool_.clear();
     search_qg(query, knn, results);
 }
@@ -269,25 +272,29 @@ inline void QuantizedGraph::search_qg(
     /* Current version of fast scan compute 32 distances */
     std::vector<float> appro_dist(degree_bound_);  // approximate dis
 
+    VisitedList *vl = visited_list_pool_.getFreeVisitedList();
+    vl_type* visited_array = vl->mass;
+    vl_type visited_array_tag = vl->curV;
+
     while (search_pool_.has_next()) {
         PID cur_node = search_pool_.pop();
-        if (visited_.get(cur_node)) {
-            continue;
+        if (visited_array[cur_node] != visited_array_tag) {
+            visited_array[cur_node] = visited_array_tag;
+            float sqr_y = scan_neighbors(
+                q_obj,
+                get_vector(cur_node),
+                appro_dist.data(),
+                this->search_pool_,
+                this->degree_bound_
+            );
+            res_pool.insert(cur_node, sqr_y);
         }
-        visited_.set(cur_node);
-
-        float sqr_y = scan_neighbors(
-            q_obj,
-            get_vector(cur_node),
-            appro_dist.data(),
-            this->search_pool_,
-            this->degree_bound_
-        );
-        res_pool.insert(cur_node, sqr_y);
     }
 
     update_results(res_pool, query);
     res_pool.copy_results(results);
+
+    visited_list_pool_.releaseVisitedList(vl);
 }
 
 // scan a data row (including data vec and quantization codes for its neighbors)
