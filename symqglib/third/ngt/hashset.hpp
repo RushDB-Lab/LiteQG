@@ -21,8 +21,8 @@
 #include <climits>
 #include <cstring>
 #include <iostream>
-#include <unordered_set>
 
+#include "../../utils/lazy_cleanup_set.hpp"
 #include "../../common.hpp"
 #include "../../utils/memory.hpp"
 
@@ -32,7 +32,7 @@ class HashBasedBooleanSet {
     size_t table_size_ = 0;
     PID mask_ = 0;
     std::vector<PID, memory::AlignedAllocator<PID>> table_;
-    std::unordered_set<PID> stl_hash_;
+    LazyCleanupSet<PID> stl_hash_;
 
     [[nodiscard]] auto hash1(const PID value) const { return value & mask_; }
 
@@ -93,7 +93,7 @@ class HashBasedBooleanSet {
         if (val == data_id) {
             return true;
         }
-        return (val != kPidMax && stl_hash_.find(data_id) != stl_hash_.end());
+        return (val != kPidMax && stl_hash_.contains(data_id));
     }
 
     void set(PID data_id) {
