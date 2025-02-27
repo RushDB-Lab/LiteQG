@@ -1,0 +1,5 @@
+{
+    "name": "SymphonyQG Dev Container",
+    "dockerFile": "Dockerfile",
+    "postCreateCommand": "python3 -m pip install -r ./python/requirements.txt",
+}
