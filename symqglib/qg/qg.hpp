@@ -7,9 +7,10 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <queue>
 
 #include "../common.hpp"
-#include "../quantization/rabitq.hpp"
+#include "../quantization/sq8.hpp"
 #include "../space/l2.hpp"
 #include "../third/ngt/hashset.hpp"
 #include "../third/svs/array.hpp"
@@ -19,7 +20,6 @@
 #include "../utils/rotator.hpp"
 #include "./qg_query.hpp"
 #include "./qg_scanner.hpp"
-#include <queue>
 
 namespace symqg {
 /**
@@ -43,6 +43,8 @@ class QuantizedGraph {
     size_t padded_dim_ = 0;    // padded dimension
     PID entry_point_ = 0;      // Entry point of graph
 
+    std::vector<SQ8Params> sq8_params_;  // 每维度一个 min 和 scale
+
     data::Array<
         float,
         std::vector<size_t>,
@@ -53,13 +55,13 @@ class QuantizedGraph {
         data_;  // vectors + graph + quantization codes
 
     data::Array<
-    uint8_t,
-    std::vector<size_t>,
-    memory::AlignedAllocator<
         uint8_t,
-        1 << 22,
-        true>>
-    qdata_;  // u8 vectors
+        std::vector<size_t>,
+        memory::AlignedAllocator<
+            uint8_t,
+            1 << 22,
+            true>>
+        qdata_;  // u8 vectors
 
     size_t cur_ef_;
 
@@ -135,8 +137,7 @@ class QuantizedGraph {
     }
 
     void
-    find_candidates(PID, size_t, std::vector<Candidate<float>>&, HashBasedBooleanSet&, const std::vector<uint32_t>&)
-        const;
+    find_candidates(PID, size_t, std::vector<Candidate<float>>&, HashBasedBooleanSet&, const std::vector<uint32_t>&) const;
 
     void update_qg(PID, const std::vector<Candidate<float>>&);
 
@@ -175,9 +176,7 @@ class QuantizedGraph {
     );
 
     void search_qg_with_heap(
-        const float* __restrict__ query,
-        uint32_t knn,
-        uint32_t* __restrict__ results
+        const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
     );
 };
 
@@ -200,69 +199,28 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
         float* dst = get_vector(i);
         std::copy(src, src + dimension_, dst);
     }
-    for (size_t i = 0; i < num_points_; ++i) {
-        const float* src = data + (dimension_ * i);
-        uint8_t* dst = get_qvector(i);
-        for (int i = 0; i < dimension_; ++i) {
-            dst[i] = static_cast<uint8_t>(src[i]);
-        }
-    }
-    std::cout << "\tVectors Copied\n";
+    sq8_quantize(data, dimension_, num_points_, qdata_.data(), sq8_params_.data());
+    std::cout << "\tVectors Copied and Quantized with SQ8\n";
 }
 
 inline void QuantizedGraph::save_index(const char* filename) const {
-    std::cout << "Saving quantized graph to " << filename << '\n';
     std::ofstream output(filename, std::ios::binary);
-    assert(output.is_open());
-
-    /* Basic variants */
     output.write(reinterpret_cast<const char*>(&entry_point_), sizeof(PID));
-
-    /* Data */
     data_.save(output);
     qdata_.save(output);
-
-    /* Rotator */
-    this->rotator_.save(output);
-
+    output.write(
+        reinterpret_cast<const char*>(sq8_params_.data()), dimension_ * sizeof(SQ8Params)
+    );
     output.close();
-    std::cout << "\tQuantized graph saved!\n";
 }
 
 inline void QuantizedGraph::load_index(const char* filename) {
-    std::cout << "loading quantized graph " << filename << '\n';
-
-    /* Check existence */
-    if (!file_exists(filename)) {
-        std::cerr << "Index does not exist!\n";
-        abort();
-    }
-
-    /* Check file size */
-    size_t filesize = get_filesize(filename);
-    size_t correct_size = sizeof(PID) + (sizeof(float) * num_points_ * row_offset_) +
-                          (sizeof(float) * padded_dim_);
-    if (filesize != correct_size) {
-        std::cerr << "Index file size error! Please make sure the index and "
-                     "init parameters are correct\n";
-        abort();
-    }
-
     std::ifstream input(filename, std::ios::binary);
-    assert(input.is_open());
-
-    /* Basic variants */
     input.read(reinterpret_cast<char*>(&entry_point_), sizeof(PID));
-
-    /* Data */
     data_.load(input);
     qdata_.load(input);
-
-    /* Rotator */
-    this->rotator_.load(input);
-
+    input.read(reinterpret_cast<char*>(sq8_params_.data()), dimension_ * sizeof(SQ8Params));
     input.close();
-    std::cout << "Quantized graph loaded!\n";
 }
 
 inline void QuantizedGraph::set_ef(size_t cur_ef) {
@@ -334,89 +292,54 @@ struct CandidateComparator {
     }
 };
 
-using MaxHeap = std::priority_queue<Candidate<float>,
-                                               std::vector<Candidate<float>>,
-                                               CandidateComparator>;
+using MaxHeap = std::
+    priority_queue<Candidate<float>, std::vector<Candidate<float>>, CandidateComparator>;
 
-/**
- * @brief search on qg
- *
- * @param query     unrotated query vector, dimension_ elements
- * @param rd_query  rotated query vector, padded_dim_ elements
- * @param knn       num of nearest neighbors
- * @param results   searh res
- */
 inline void QuantizedGraph::search_qg_with_heap(
-    const float* __restrict__ query,
-    uint32_t knn,
-    uint32_t* __restrict__ results
+    const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
 ) {
-    /* Variables used for searching */
-    float sqr_y = 0;                       // square of distance from query to centroid
-    PID cur_node = 0;                      // current visiting node in graph
-    uint32_t cur_degree = 0;               // degree of current node in graph
-    PID cur_neighbor = 0;                  // current neighbor
-    const PID* ptr_nb = nullptr;           // ptr of neighbors
+    MaxHeap search_pool, res_pool;
+    visited_.clear();
 
-    // memory::AlignedAllocator<Candidate<float>> allocator;
-    MaxHeap search_pool;
-    MaxHeap res_pool;
-
-    uint8_t qquery[dimension_];
-    for (int i = 0; i < dimension_; ++i) {
-        qquery[i] = static_cast<uint8_t>(query[i]);
-    }
-
-    cur_node = this->entry_point_;
-    sqr_y = space::l2_sqr_uint8(qquery, get_qvector(cur_node), dimension_);
+    float decoded_vec[dimension_];
+    PID cur_node = entry_point_;  // 显式声明并初始化为入口点
+    sq8_dequantize(get_qvector(cur_node), dimension_, decoded_vec, sq8_params_.data());
+    float sqr_y = space::l2_sqr(query, decoded_vec, dimension_);
     float lowerBound = sqr_y;
     search_pool.emplace(cur_node, -sqr_y);
     res_pool.emplace(cur_node, sqr_y);
     visited_.set(cur_node);
-    
+
     while (!search_pool.empty()) {
-        auto &candidate = search_pool.top();
-        cur_node = candidate.id;
-        if (-candidate.distance > lowerBound) {
+        auto& candidate = search_pool.top();
+        cur_node = candidate.id;  // 更新 cur_node 为当前处理的节点
+        if (-candidate.distance > lowerBound)
             break;
-        }
         search_pool.pop();
-        
-        ptr_nb = get_neighbors(cur_node);
-        
-        for (uint32_t i = 0; i < cur_degree; ++i) {
-            cur_neighbor = ptr_nb[i];
-            if (!visited_.get(cur_node)) {
-                visited_.set(cur_node);
-                sqr_y = space::l2_sqr_uint8(qquery, get_qvector(cur_neighbor), dimension_);
+
+        const PID* ptr_nb = get_neighbors(cur_node);
+        for (uint32_t i = 0; i < degree_bound_; ++i) {
+            PID cur_neighbor = ptr_nb[i];
+            if (!visited_.get(cur_neighbor)) {
+                visited_.set(cur_neighbor);
+                sq8_dequantize(
+                    get_qvector(cur_neighbor), dimension_, decoded_vec, sq8_params_.data()
+                );
+                sqr_y = space::l2_sqr(query, decoded_vec, dimension_);
                 if (res_pool.size() < cur_ef_ || lowerBound > sqr_y) {
                     search_pool.emplace(cur_neighbor, -sqr_y);
                     res_pool.emplace(cur_neighbor, sqr_y);
-                    if (res_pool.size() > cur_ef_) {
+                    if (res_pool.size() > cur_ef_)
                         res_pool.pop();
-                    }
-                    if (!res_pool.empty()) {
-                        lowerBound = res_pool.top().distance;
-                    }
+                    lowerBound = res_pool.top().distance;
                 }
             }
-            memory::mem_prefetch_l2(
-                reinterpret_cast<char*>(get_vector(cur_neighbor)), 10
-            );
         }
     }
 
-    while (res_pool.size() > knn) {
+    for (int i = knn - 1; i >= 0 && !res_pool.empty(); --i) {
+        results[i] = res_pool.top().id;
         res_pool.pop();
-    }
-
-    for (int i = 0; i < knn; ++i) {
-        if (!res_pool.empty()) {
-            results[i] = res_pool.top().id;
-            res_pool.pop();
-        } else {
-            results[i] = 0;
-        }
     }
 }
 
@@ -495,26 +418,21 @@ inline void QuantizedGraph::update_results(
 }
 
 inline void QuantizedGraph::initialize() {
-    /* check size */
     assert(padded_dim_ % 64 == 0);
     assert(padded_dim_ >= dimension_);
-
-    this->code_offset_ = dimension_;  // Pos of packed code (aligned)
-    this->factor_offset_ =
-        code_offset_ + padded_dim_ / 64 * 2 * degree_bound_;  // Pos of Factor
-    this->neighbor_offset_ =
-        factor_offset_ + sizeof(Factor) * degree_bound_ / sizeof(float);
+    this->neighbor_offset_ = dimension_;  // 仅保留邻居偏移
     this->row_offset_ = neighbor_offset_ + degree_bound_;
-
-    /* Allocate memory of data*/
     data_ = data::
         Array<float, std::vector<size_t>, memory::AlignedAllocator<float, 1 << 22, true>>(
             std::vector<size_t>{num_points_, row_offset_}
         );
-    qdata_ = data::
-    Array<uint8_t, std::vector<size_t>, memory::AlignedAllocator<uint8_t, 1 << 22, true>>(
+    qdata_ = data::Array<
+        uint8_t,
+        std::vector<size_t>,
+        memory::AlignedAllocator<uint8_t, 1 << 22, true>>(
         std::vector<size_t>{num_points_, dimension_}
     );
+    sq8_params_.resize(dimension_);
 }
 
 // find candidate neighbors for cur_id, exclude the vertex itself
@@ -581,22 +499,5 @@ inline void QuantizedGraph::update_qg(
     }
     const auto* cur_cent = get_vector(cur_id);
     std::copy(cur_cent, cur_cent + dimension_, &c_pad(0, 0));
-
-    /* rotate Matrix */
-    RowMatrix<float> x_rotated(cur_degree, padded_dim_);
-    RowMatrix<float> c_rotated(1, padded_dim_);
-    for (long i = 0; i < static_cast<long>(cur_degree); ++i) {
-        this->rotator_.rotate(&x_pad(i, 0), &x_rotated(i, 0));
-    }
-    this->rotator_.rotate(&c_pad(0, 0), &c_rotated(0, 0));
-
-    // Get codes and factors for rabitq
-    float* fac_ptr = get_factor(cur_id);
-    float* triple_x = fac_ptr;
-    float* factor_dq = triple_x + this->degree_bound_;
-    float* factor_vq = factor_dq + this->degree_bound_;
-    rabitq_codes(
-        x_rotated, c_rotated, get_packed_code(cur_id), triple_x, factor_dq, factor_vq
-    );
 }
 }  // namespace symqg
