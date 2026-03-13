@@ -226,6 +226,8 @@ inline void QuantizedGraph::search(
         }
     }
 
+    while (res_pool.size() > knn)
+        res_pool.pop();
     for (int i = knn - 1; i >= 0 && !res_pool.empty(); --i) {
         results[i] = res_pool.top().id;
         res_pool.pop();
