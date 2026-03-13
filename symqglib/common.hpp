@@ -35,6 +35,6 @@ struct Candidate {
 
     auto operator<(const Candidate& other) const { return distance < other.distance; }
 
-    auto operator>(const Candidate& other) const { return !(*this < other); }
+    auto operator>(const Candidate& other) const { return other < *this; }
 };
 }  // namespace symqg

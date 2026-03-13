@@ -17,7 +17,7 @@ void sq8_quantize(const float* data, size_t dim, size_t num, uint8_t* quantized,
             max = std::max(max, val);
         }
         params[d].min = min;
-        params[d].scale = (max - min) / 255.0f;
+        params[d].scale = (max == min) ? 1.0f : (max - min) / 255.0f;
         for (size_t i = 0; i < num; ++i) {
             float val = data[i * dim + d];
             quantized[i * dim + d] = static_cast<uint8_t>(std::round((val - min) / params[d].scale));
