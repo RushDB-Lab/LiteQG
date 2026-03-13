@@ -88,6 +88,8 @@ class QGBuilder {
             iter(false);
         }
         iter(true);
+        // Copy final neighbor IDs into qdata_ for colocated query access
+        qg_.finalize_index();
     }
 
     void check_dup() const {
