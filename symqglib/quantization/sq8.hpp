@@ -117,4 +117,20 @@ inline float sq8_l2_sqr(
     return result;
 }
 
+// Quantize a query vector to uint8 using the same SQ8 parameters as the database.
+// Enables direct uint8-vs-uint8 L2 distance computation.
+inline void sq8_quantize_query(
+    const float* __restrict__ query,
+    size_t dim,
+    const float* __restrict__ min_vals,
+    const float* __restrict__ scale_vals,
+    uint8_t* __restrict__ out
+) {
+    for (size_t i = 0; i < dim; ++i) {
+        float val = (query[i] - min_vals[i]) / scale_vals[i];
+        val = std::max(0.0f, std::min(255.0f, std::round(val)));
+        out[i] = static_cast<uint8_t>(val);
+    }
+}
+
 }  // namespace symqg

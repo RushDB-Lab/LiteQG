@@ -220,23 +220,25 @@ using MaxHeap = std::
     priority_queue<Candidate<float>, std::vector<Candidate<float>>, CandidateComparator>;
 
 /*
- * Query-time search using SQ8 approximate distances.
- * All data accessed from qdata_ (colocated SQ8 vec + neighbor IDs).
- * Prefetches future neighbors to hide memory latency.
+ * Query-time search using symmetric uint8 L2 distance.
+ * Query is quantized to uint8 once, then all distance computations
+ * are integer-only (no float conversion, no min/scale per neighbor).
  */
 inline void QuantizedGraph::search(
     const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
 ) {
     visited_.clear();
 
+    // Quantize query to uint8 once (O(dim), negligible)
+    std::vector<uint8_t> q_u8(dimension_);
+    sq8_quantize_query(query, dimension_, sq8_min_.data(), sq8_scale_.data(), q_u8.data());
+
     MaxHeap search_pool, res_pool;
     constexpr size_t PREFETCH_AHEAD = 4;
 
     // Start from entry point
     PID cur_node = entry_point_;
-    float sqr_y = sq8_l2_sqr(
-        query, get_qvector(cur_node), sq8_min_.data(), sq8_scale_.data(), dimension_
-    );
+    float sqr_y = space::l2_sqr_uint8(q_u8.data(), get_qvector(cur_node), dimension_);
     float lowerBound = sqr_y;
     search_pool.emplace(cur_node, -sqr_y);
     res_pool.emplace(cur_node, sqr_y);
@@ -272,9 +274,8 @@ inline void QuantizedGraph::search(
             PID cur_neighbor = ptr_nb[i];
             if (!visited_.get(cur_neighbor)) {
                 visited_.set(cur_neighbor);
-                sqr_y = sq8_l2_sqr(
-                    query, get_qvector(cur_neighbor),
-                    sq8_min_.data(), sq8_scale_.data(), dimension_
+                sqr_y = space::l2_sqr_uint8(
+                    q_u8.data(), get_qvector(cur_neighbor), dimension_
                 );
                 if (res_pool.size() < cur_ef_ || lowerBound > sqr_y) {
                     search_pool.emplace(cur_neighbor, -sqr_y);
