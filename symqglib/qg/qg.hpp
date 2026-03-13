@@ -30,7 +30,8 @@ class QuantizedGraph {
     size_t dimension_ = 0;
     PID entry_point_ = 0;
 
-    std::vector<SQ8Params> sq8_params_;
+    std::vector<float> sq8_min_;    // per-dimension min values (SoA)
+    std::vector<float> sq8_scale_; // per-dimension scale values (SoA)
 
     // Raw vectors + neighbor IDs (used during build, raw vectors also kept for reranking)
     data::Array<
@@ -136,7 +137,7 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
         float* dst = get_vector(i);
         std::copy(src, src + dimension_, dst);
     }
-    sq8_quantize(data, dimension_, num_points_, qdata_.data(), sq8_params_.data());
+    sq8_quantize(data, dimension_, num_points_, qdata_.data(), sq8_min_.data(), sq8_scale_.data());
     std::cout << "\tVectors Copied and Quantized with SQ8\n";
 }
 
@@ -146,7 +147,10 @@ inline void QuantizedGraph::save_index(const char* filename) const {
     data_.save(output);
     qdata_.save(output);
     output.write(
-        reinterpret_cast<const char*>(sq8_params_.data()), dimension_ * sizeof(SQ8Params)
+        reinterpret_cast<const char*>(sq8_min_.data()), dimension_ * sizeof(float)
+    );
+    output.write(
+        reinterpret_cast<const char*>(sq8_scale_.data()), dimension_ * sizeof(float)
     );
     output.close();
 }
@@ -156,7 +160,8 @@ inline void QuantizedGraph::load_index(const char* filename) {
     input.read(reinterpret_cast<char*>(&entry_point_), sizeof(PID));
     data_.load(input);
     qdata_.load(input);
-    input.read(reinterpret_cast<char*>(sq8_params_.data()), dimension_ * sizeof(SQ8Params));
+    input.read(reinterpret_cast<char*>(sq8_min_.data()), dimension_ * sizeof(float));
+    input.read(reinterpret_cast<char*>(sq8_scale_.data()), dimension_ * sizeof(float));
     input.close();
 }
 
@@ -187,12 +192,12 @@ inline void QuantizedGraph::search(
     visited_.clear();
 
     MaxHeap search_pool, res_pool;
-    std::vector<float> decoded_vec(dimension_);
 
     // Start from entry point
     PID cur_node = entry_point_;
-    sq8_dequantize(get_qvector(cur_node), dimension_, decoded_vec.data(), sq8_params_.data());
-    float sqr_y = space::l2_sqr(query, decoded_vec.data(), dimension_);
+    float sqr_y = sq8_l2_sqr(
+        query, get_qvector(cur_node), sq8_min_.data(), sq8_scale_.data(), dimension_
+    );
     float lowerBound = sqr_y;
     search_pool.emplace(cur_node, -sqr_y);
     res_pool.emplace(cur_node, sqr_y);
@@ -210,11 +215,10 @@ inline void QuantizedGraph::search(
             PID cur_neighbor = ptr_nb[i];
             if (!visited_.get(cur_neighbor)) {
                 visited_.set(cur_neighbor);
-                sq8_dequantize(
-                    get_qvector(cur_neighbor), dimension_, decoded_vec.data(),
-                    sq8_params_.data()
+                sqr_y = sq8_l2_sqr(
+                    query, get_qvector(cur_neighbor),
+                    sq8_min_.data(), sq8_scale_.data(), dimension_
                 );
-                sqr_y = space::l2_sqr(query, decoded_vec.data(), dimension_);
                 if (res_pool.size() < cur_ef_ || lowerBound > sqr_y) {
                     search_pool.emplace(cur_neighbor, -sqr_y);
                     res_pool.emplace(cur_neighbor, sqr_y);
@@ -247,7 +251,8 @@ inline void QuantizedGraph::initialize() {
         memory::AlignedAllocator<uint8_t, 1 << 22, true>>(
         std::vector<size_t>{num_points_, dimension_}
     );
-    sq8_params_.resize(dimension_);
+    sq8_min_.resize(dimension_);
+    sq8_scale_.resize(dimension_);
 }
 
 // Build-time: beam search on graph using exact L2 distance
