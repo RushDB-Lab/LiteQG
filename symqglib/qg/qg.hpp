@@ -230,7 +230,7 @@ inline void QuantizedGraph::search(
     visited_.clear();
 
     MaxHeap search_pool, res_pool;
-    constexpr uint32_t PREFETCH_AHEAD = 4;
+    constexpr size_t PREFETCH_AHEAD = 4;
 
     // Start from entry point
     PID cur_node = entry_point_;
