@@ -82,15 +82,20 @@ static inline void appro_dist_impl(
 
 class QGScanner {
    private:
-    // func for packing lookup tables
     size_t padded_dim_;
     size_t degree_bound_;
+    // Pre-allocated buffers to avoid hot-path allocations
+    mutable std::vector<uint16_t> result_;
+    mutable std::vector<float> result_float_;
 
    public:
     QGScanner() = default;
 
     explicit QGScanner(size_t padded_dim, size_t degree_bound)
-        : padded_dim_(padded_dim), degree_bound_(degree_bound) {}
+        : padded_dim_(padded_dim)
+        , degree_bound_(degree_bound)
+        , result_(degree_bound)
+        , result_float_(degree_bound) {}
 
     void pack_lut(const uint8_t* __restrict__ byte_query, uint8_t* __restrict__ LUT) const {
         pack_lut_impl(padded_dim_, byte_query, LUT);
@@ -106,22 +111,19 @@ class QGScanner {
         const uint8_t* packed_code,
         const float* factor
     ) const {
-        std::vector<uint16_t> result(degree_bound_);
-
         /* Compute block by block */
         for (size_t i = 0; i < degree_bound_; i += kBatchSize) {
-            accumulate_impl(padded_dim_, packed_code, LUT, &result[i]);
+            accumulate_impl(padded_dim_, packed_code, LUT, &result_[i]);
             packed_code = &packed_code[padded_dim_ << 2];
         }
 
-        /* Cast to float and multiple by 2 then minus sumq */
-        std::vector<float> result_float(degree_bound_);
+        /* Cast to float and multiply by 2 then minus sumq */
 #if defined(__AVX512F__)
         const __m512i qq = _mm512_set1_epi32(sumq);
         for (size_t i = 0; i < degree_bound_; i += 32) {
-            __m256i i16a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&result[i]));
+            __m256i i16a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&result_[i]));
             __m256i i16b =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&result[i + 16]));
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&result_[i + 16]));
             __m512i i32a = _mm512_cvtepi16_epi32(i16a);
             __m512i i32b = _mm512_cvtepi16_epi32(i16b);
 
@@ -130,12 +132,12 @@ class QGScanner {
             __m512 f32a = _mm512_cvtepi32_ps(i32a);
             __m512 f32b = _mm512_cvtepi32_ps(i32b);
 
-            _mm512_storeu_ps(&result_float[i], f32a);
-            _mm512_storeu_ps(&result_float[i + 16], f32b);
+            _mm512_storeu_ps(&result_float_[i], f32a);
+            _mm512_storeu_ps(&result_float_[i + 16], f32b);
         }
 #else
         for (size_t i = 0; i < degree_bound_; ++i) {
-            result_float[i] = static_cast<float>((static_cast<int>(result[i]) << 1) - sumq);
+            result_float_[i] = static_cast<float>((static_cast<int>(result_[i]) << 1) - sumq);
         }
 #endif
         const float* triple_x = factor;
@@ -146,7 +148,7 @@ class QGScanner {
             sqr_y,
             width,
             vl,
-            result_float.data(),
+            result_float_.data(),
             triple_x,
             fac_dq,
             fac_vq,

@@ -448,6 +448,10 @@ inline void QuantizedGraph::search(
 
     // Approx dist buffer for one node's neighbors
     std::vector<float> appro_dist(degree_bound_);
+    // Survivor buffer for filtered neighbors
+    std::vector<PID> survivors(degree_bound_);
+    constexpr uint32_t kPrefetchAhead = 4;
+    const size_t vec_prefetch_lines = (dimension_ + 63) / 64;
 
     MaxHeap search_pool, res_pool;
 
@@ -481,25 +485,40 @@ inline void QuantizedGraph::search(
             packed_codes_ptr, factors_ptr
         );
 
-        // Filter + accurate re-score
+        // Collect survivors: filter by visited + fastscan distance
+        uint32_t num_survivors = 0;
         for (uint32_t i = 0; i < degree_bound_; ++i) {
             PID cur_neighbor = ptr_nb[i];
             if (visited_.get(cur_neighbor)) {
                 continue;
             }
             visited_.set(cur_neighbor);
-
-            // Fastscan filter: skip if approx distance worse than current bound
             if (res_pool.size() >= cur_ef_ && appro_dist[i] > lowerBound) {
                 continue;
             }
+            survivors[num_survivors++] = cur_neighbor;
+        }
 
-            // Accurate re-score with CAQ
-            // Prefetch the CAQ codes for this neighbor
+        // Prefetch CAQ data for all survivors
+        for (uint32_t s = 0; s < std::min(num_survivors, kPrefetchAhead); ++s) {
             memory::mem_prefetch_l1(
-                reinterpret_cast<const char*>(&vec_codes_[cur_neighbor * dimension_]),
-                (dimension_ + 63) / 64
+                reinterpret_cast<const char*>(&vec_codes_[survivors[s] * dimension_]),
+                vec_prefetch_lines
             );
+        }
+
+        // Accurate re-score survivors with CAQ
+        for (uint32_t s = 0; s < num_survivors; ++s) {
+            if (s + kPrefetchAhead < num_survivors) {
+                memory::mem_prefetch_l1(
+                    reinterpret_cast<const char*>(
+                        &vec_codes_[survivors[s + kPrefetchAhead] * dimension_]
+                    ),
+                    vec_prefetch_lines
+                );
+            }
+
+            PID cur_neighbor = survivors[s];
             sqr_y = caq_l2_estimate(
                 centered_q.data(), &vec_codes_[cur_neighbor * dimension_],
                 &caq_factors_[cur_neighbor],
