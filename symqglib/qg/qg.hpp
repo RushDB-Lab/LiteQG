@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "../common.hpp"
-#include "../quantization/sq8.hpp"
+#include "../quantization/caq.hpp"
 #include "../space/l2.hpp"
 #include "../third/ngt/hashset.hpp"
 #include "../third/svs/array.hpp"
@@ -30,8 +30,9 @@ class QuantizedGraph {
     size_t dimension_ = 0;
     PID entry_point_ = 0;
 
-    std::vector<float> sq8_min_;    // per-dimension min values (SoA)
-    std::vector<float> sq8_scale_;  // per-dimension scale values (SoA)
+    // CAQ per-vector factors stored separately for alignment
+    // (indexed by point ID, not colocated in qdata_ to keep code[] contiguous for SIMD)
+    std::vector<CaqFactors> caq_factors_;
 
     // Build-time: raw vectors + neighbor IDs
     //   Layout: [raw_vec (dimension_ floats) | neighbor_IDs (degree_bound_ PIDs)]
@@ -41,8 +42,8 @@ class QuantizedGraph {
         memory::AlignedAllocator<float, 1 << 22, true>>
         data_;
 
-    // Query-time: SQ8 vectors + neighbor IDs colocated for cache locality
-    //   Layout: [sq8_vec (dimension_ bytes) | neighbor_IDs (degree_bound_ * 4 bytes)]
+    // Query-time: CAQ codes + neighbor IDs colocated for cache locality
+    //   Layout: [caq_code (dimension_ bytes) | neighbor_IDs (degree_bound_ * 4 bytes)]
     data::Array<
         uint8_t,
         std::vector<size_t>,
@@ -150,23 +151,23 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
         std::copy(src, src + dimension_, dst);
     }
 
-    // SQ8 quantize into temporary contiguous buffer
-    std::vector<uint8_t> tmp_quantized(num_points_ * dimension_);
-    sq8_quantize(
-        data, dimension_, num_points_, tmp_quantized.data(),
-        sq8_min_.data(), sq8_scale_.data()
+    // CAQ quantize into temporary contiguous buffer
+    std::vector<uint8_t> tmp_codes(num_points_ * dimension_);
+    caq_quantize(
+        data, dimension_, num_points_,
+        tmp_codes.data(), caq_factors_.data()
     );
 
-    // Scatter into qdata_ rows (SQ8 vec portion only; neighbors copied later)
+    // Scatter into qdata_ rows (CAQ code portion only; neighbors copied later)
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
         std::memcpy(
             &qdata_.at(q_row_offset_ * i),
-            &tmp_quantized[dimension_ * i],
+            &tmp_codes[dimension_ * i],
             dimension_
         );
     }
-    std::cout << "\tVectors Copied and Quantized with SQ8\n";
+    std::cout << "\tVectors Copied and Quantized with CAQ\n";
 }
 
 inline void QuantizedGraph::finalize_index() {
@@ -186,10 +187,8 @@ inline void QuantizedGraph::save_index(const char* filename) const {
     data_.save(output);
     qdata_.save(output);
     output.write(
-        reinterpret_cast<const char*>(sq8_min_.data()), dimension_ * sizeof(float)
-    );
-    output.write(
-        reinterpret_cast<const char*>(sq8_scale_.data()), dimension_ * sizeof(float)
+        reinterpret_cast<const char*>(caq_factors_.data()),
+        static_cast<std::streamsize>(num_points_ * sizeof(CaqFactors))
     );
     output.close();
 }
@@ -199,8 +198,10 @@ inline void QuantizedGraph::load_index(const char* filename) {
     input.read(reinterpret_cast<char*>(&entry_point_), sizeof(PID));
     data_.load(input);
     qdata_.load(input);
-    input.read(reinterpret_cast<char*>(sq8_min_.data()), dimension_ * sizeof(float));
-    input.read(reinterpret_cast<char*>(sq8_scale_.data()), dimension_ * sizeof(float));
+    input.read(
+        reinterpret_cast<char*>(caq_factors_.data()),
+        static_cast<std::streamsize>(num_points_ * sizeof(CaqFactors))
+    );
     input.close();
 }
 
@@ -220,8 +221,9 @@ using MaxHeap = std::
     priority_queue<Candidate<float>, std::vector<Candidate<float>>, CandidateComparator>;
 
 /*
- * Query-time search using fused SQ8 dequantize + L2 distance.
- * All data accessed from qdata_ (colocated SQ8 vec + neighbor IDs).
+ * Query-time search using CAQ distance estimation.
+ * All code data accessed from qdata_ (colocated CAQ codes + neighbor IDs).
+ * Per-vector factors accessed from caq_factors_.
  * Prefetches future neighbors to hide memory latency.
  */
 inline void QuantizedGraph::search(
@@ -229,13 +231,22 @@ inline void QuantizedGraph::search(
 ) {
     visited_.clear();
 
+    // Precompute per-query constants for CAQ distance
+    float q_l2sqr = 0;
+    float sum_q = 0;
+    for (size_t d = 0; d < dimension_; ++d) {
+        q_l2sqr += query[d] * query[d];
+        sum_q += query[d];
+    }
+
     MaxHeap search_pool, res_pool;
     constexpr size_t PREFETCH_AHEAD = 4;
 
     // Start from entry point
     PID cur_node = entry_point_;
-    float sqr_y = sq8_l2_sqr(
-        query, get_qvector(cur_node), sq8_min_.data(), sq8_scale_.data(), dimension_
+    float sqr_y = caq_l2_estimate(
+        query, get_qvector(cur_node), &caq_factors_[cur_node],
+        q_l2sqr, sum_q, dimension_
     );
     float lowerBound = sqr_y;
     search_pool.emplace(cur_node, -sqr_y);
@@ -243,16 +254,17 @@ inline void QuantizedGraph::search(
     visited_.set(cur_node);
 
     while (!search_pool.empty()) {
-        auto& candidate = search_pool.top();
+        const auto& candidate = search_pool.top();
         cur_node = candidate.id;
-        if (-candidate.distance > lowerBound)
+        if (-candidate.distance > lowerBound) {
             break;
+        }
         search_pool.pop();
 
-        // Read neighbors from qdata_ (colocated with SQ8 vecs)
+        // Read neighbors from qdata_ (colocated with CAQ codes)
         const PID* ptr_nb = get_qneighbors(cur_node);
 
-        // Prefetch initial batch of neighbors' full rows (SQ8 vec + neighbor IDs)
+        // Prefetch initial batch of neighbors' full rows (CAQ codes + neighbor IDs)
         for (uint32_t j = 0; j < std::min(degree_bound_, PREFETCH_AHEAD); ++j) {
             memory::mem_prefetch_l2(
                 reinterpret_cast<const char*>(get_qvector(ptr_nb[j])),
@@ -261,7 +273,7 @@ inline void QuantizedGraph::search(
         }
 
         for (uint32_t i = 0; i < degree_bound_; ++i) {
-            // Prefetch ahead: when processing neighbor i, prefetch neighbor i+PREFETCH_AHEAD
+            // Prefetch ahead
             if (i + PREFETCH_AHEAD < degree_bound_) {
                 memory::mem_prefetch_l2(
                     reinterpret_cast<const char*>(get_qvector(ptr_nb[i + PREFETCH_AHEAD])),
@@ -272,23 +284,25 @@ inline void QuantizedGraph::search(
             PID cur_neighbor = ptr_nb[i];
             if (!visited_.get(cur_neighbor)) {
                 visited_.set(cur_neighbor);
-                sqr_y = sq8_l2_sqr(
-                    query, get_qvector(cur_neighbor),
-                    sq8_min_.data(), sq8_scale_.data(), dimension_
+                sqr_y = caq_l2_estimate(
+                    query, get_qvector(cur_neighbor), &caq_factors_[cur_neighbor],
+                    q_l2sqr, sum_q, dimension_
                 );
                 if (res_pool.size() < cur_ef_ || lowerBound > sqr_y) {
                     search_pool.emplace(cur_neighbor, -sqr_y);
                     res_pool.emplace(cur_neighbor, sqr_y);
-                    if (res_pool.size() > cur_ef_)
+                    if (res_pool.size() > cur_ef_) {
                         res_pool.pop();
+                    }
                     lowerBound = res_pool.top().distance;
                 }
             }
         }
     }
 
-    while (res_pool.size() > knn)
+    while (res_pool.size() > knn) {
         res_pool.pop();
+    }
     for (int i = knn - 1; i >= 0 && !res_pool.empty(); --i) {
         results[i] = res_pool.top().id;
         res_pool.pop();
@@ -304,7 +318,7 @@ inline void QuantizedGraph::initialize() {
             std::vector<size_t>{num_points_, row_offset_}
         );
 
-    // Query-time layout (qdata_): sq8_vec + neighbor_IDs (colocated)
+    // Query-time layout (qdata_): caq_code + neighbor_IDs (colocated)
     this->q_neighbor_offset_ = dimension_;
     this->q_row_offset_ = dimension_ + degree_bound_ * sizeof(PID);
     this->q_prefetch_lines_ = (q_row_offset_ + 63) / 64;
@@ -315,8 +329,7 @@ inline void QuantizedGraph::initialize() {
         std::vector<size_t>{num_points_, q_row_offset_}
     );
 
-    sq8_min_.resize(dimension_);
-    sq8_scale_.resize(dimension_);
+    caq_factors_.resize(num_points_);
 }
 
 // Build-time: beam search on graph using exact L2 distance
