@@ -12,7 +12,6 @@
 #include "../common.hpp"
 #include "../quantization/rabitq.hpp"
 #include "../quantization/saq_plan.hpp"
-#include "../space/bitwise.hpp"
 #include "../space/l2.hpp"
 #include "../third/ngt/hashset.hpp"
 #include "../third/svs/array.hpp"
@@ -51,9 +50,6 @@ class QuantizedGraph {
     QGScanner scanner_;
     HashBasedBooleanSet visited_;
     buffer::SearchBuffer search_pool_;
-
-    // Build-time only: FHT-rotated vectors [N * padded_dim_], freed after build
-    std::vector<float> rotated_vecs_;
 
     // Offsets within each row (float units)
     size_t code_offset_ = 0;
@@ -172,18 +168,7 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
     constexpr float kAvgBits = 4.0f;
     quant_plan_ = segment_dp(pca_rotator_.eigenvalues().data(), dimension_, kAvgBits);
 
-    // FHT-rotate all vectors → rotated_vecs_ (build-time, padded_dim_ per vector)
-    rotated_vecs_.resize(num_points_ * padded_dim_);
-
-#pragma omp parallel for schedule(dynamic)
-    for (size_t i = 0; i < num_points_; ++i) {
-        const float* raw_vec = data + i * dimension_;
-        float* dst = &rotated_vecs_[i * padded_dim_];
-        // FHTRotator::rotate pads to padded_dim_ and applies FHT
-        rotator_.rotate(raw_vec, dst);
-    }
-
-    std::cout << "\tVectors Copied, FHT Rotated\n";
+    std::cout << "\tVectors Copied\n";
 }
 
 inline void QuantizedGraph::update_qg(
@@ -200,45 +185,35 @@ inline void QuantizedGraph::update_qg(
         neighbor_ptr[i] = new_neighbors[i].id;
     }
 
-    // Per-node centroid = rotated_vecs_[cur_id] (in FHT-rotated space)
-    const float* centroid = &rotated_vecs_[cur_id * padded_dim_];
-
-    size_t words_per_vec = padded_dim_ / 64;
-    std::vector<float> residual(padded_dim_, 0.0f);
-    std::vector<int> binary(padded_dim_, 0);
-    std::vector<uint64_t> all_binary(cur_degree * words_per_vec, 0);
-
-    float* fac_ptr = get_factor(cur_id);
-    float* triple_x = fac_ptr;
-    float* fac_dq = triple_x + degree_bound_;
-    float* fac_vq = fac_dq + degree_bound_;
+    // Rotate centroid (cur_id's raw vector) and all neighbors on-the-fly
+    RowMatrix<float> x_pad(cur_degree, padded_dim_);
+    RowMatrix<float> c_pad(1, padded_dim_);
+    x_pad.setZero();
+    c_pad.setZero();
 
     for (size_t i = 0; i < cur_degree; ++i) {
-        PID nb_id = new_neighbors[i].id;
-        const float* nb_rotated = &rotated_vecs_[nb_id * padded_dim_];
-
-        // Residual = rotated_neighbor - rotated_centroid
-        for (size_t d = 0; d < padded_dim_; ++d) {
-            residual[d] = nb_rotated[d] - centroid[d];
-        }
-
-        // Sign binarization
-        for (size_t d = 0; d < padded_dim_; ++d) {
-            binary[d] = (residual[d] > 0) ? 1 : 0;
-        }
-
-        // RaBitQ factors (use padded_dim_ as the effective dimension)
-        rabitq_factors_single(
-            residual.data(), binary.data(), centroid, padded_dim_,
-            &triple_x[i], &fac_dq[i], &fac_vq[i]
-        );
-
-        // Pack binary → uint64
-        space::pack_binary(binary.data(), &all_binary[i * words_per_vec], padded_dim_);
+        auto neighbor_id = new_neighbors[i].id;
+        const auto* cur_data = get_vector(neighbor_id);
+        std::copy(cur_data, cur_data + dimension_, &x_pad(static_cast<long>(i), 0));
     }
+    const auto* cur_cent = get_vector(cur_id);
+    std::copy(cur_cent, cur_cent + dimension_, &c_pad(0, 0));
 
-    // Pack all neighbor binaries into fastscan format
-    pack_codes(padded_dim_, all_binary.data(), cur_degree, get_packed_code(cur_id));
+    RowMatrix<float> x_rotated(cur_degree, padded_dim_);
+    RowMatrix<float> c_rotated(1, padded_dim_);
+    for (long i = 0; i < static_cast<long>(cur_degree); ++i) {
+        this->rotator_.rotate(&x_pad(i, 0), &x_rotated(i, 0));
+    }
+    this->rotator_.rotate(&c_pad(0, 0), &c_rotated(0, 0));
+
+    // Get codes and factors for RaBitQ
+    float* fac_ptr = get_factor(cur_id);
+    float* triple_x = fac_ptr;
+    float* factor_dq = triple_x + this->degree_bound_;
+    float* factor_vq = factor_dq + this->degree_bound_;
+    rabitq_codes(
+        x_rotated, c_rotated, get_packed_code(cur_id), triple_x, factor_dq, factor_vq
+    );
 }
 
 inline float QuantizedGraph::scan_neighbors(

@@ -88,9 +88,6 @@ class QGBuilder {
             iter(false);
         }
         iter(true);
-        // Free build-time rotated vectors
-        qg_.rotated_vecs_.clear();
-        qg_.rotated_vecs_.shrink_to_fit();
     }
 
     void check_dup() const {
