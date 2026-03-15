@@ -320,6 +320,7 @@ inline void QuantizedGraph::search(
     buffer::ResultBuffer res_pool(knn);
     std::vector<float> appro_dist(degree_bound_);
 
+    static int debug_count_ = 0;
     while (search_pool_.has_next()) {
         PID cur_node = search_pool_.pop();
         if (visited_.get(cur_node)) {
@@ -334,6 +335,23 @@ inline void QuantizedGraph::search(
             this->search_pool_,
             this->degree_bound_
         );
+
+        // Debug: compare fascscan vs exact for first search
+        if (debug_count_ < 1) {
+            const PID* ptr_nb = reinterpret_cast<const PID*>(
+                &get_vector(cur_node)[neighbor_offset_]);
+            std::cout << "[DEBUG] sqr_y=" << sqr_y << " node=" << cur_node << "\n";
+            for (uint32_t i = 0; i < std::min(degree_bound_, (size_t)5); ++i) {
+                float exact = space::l2_sqr(query, get_vector(ptr_nb[i]), dimension_);
+                std::cout << "  nb[" << i << "]=" << ptr_nb[i]
+                          << " approx=" << appro_dist[i]
+                          << " exact=" << exact
+                          << " ratio=" << (exact > 0 ? appro_dist[i]/exact : 0)
+                          << "\n";
+            }
+            debug_count_++;
+        }
+
         res_pool.insert(cur_node, sqr_y);
     }
 
@@ -348,27 +366,36 @@ inline void QuantizedGraph::find_candidates(
     HashBasedBooleanSet& vis,
     const std::vector<uint32_t>& degrees
 ) const {
+    // Use exact L2 for build-time candidate search (isolate graph quality)
     const float* query = get_vector(cur_id);
-    QGQuery q_obj(query, padded_dim_);
-    q_obj.query_prepare(pca_rotator_, scanner_);
 
     buffer::SearchBuffer tmp_pool(search_ef);
-    tmp_pool.insert(this->entry_point_, 1e10);
-    memory::mem_prefetch_l1(
-        reinterpret_cast<const char*>(get_vector(this->entry_point_)), 10
-    );
+    float entry_dist = space::l2_sqr(query, get_vector(this->entry_point_), dimension_);
+    tmp_pool.insert(this->entry_point_, entry_dist);
 
-    std::vector<float> appro_dist(degree_bound_);
     while (tmp_pool.has_next()) {
         auto cur_candi = tmp_pool.pop();
         if (vis.get(cur_candi)) {
             continue;
         }
         vis.set(cur_candi);
+
+        float sqr_y = space::l2_sqr(query, get_vector(cur_candi), dimension_);
+
+        const PID* ptr_nb = get_neighbors(cur_candi);
         auto cur_degree = degrees[cur_candi];
-        auto sqr_y = scan_neighbors(
-            q_obj, get_vector(cur_candi), appro_dist.data(), tmp_pool, cur_degree
-        );
+        for (uint32_t i = 0; i < cur_degree; ++i) {
+            PID cur_neighbor = ptr_nb[i];
+            if (vis.get(cur_neighbor)) {
+                continue;
+            }
+            float dist = space::l2_sqr(query, get_vector(cur_neighbor), dimension_);
+            if (tmp_pool.is_full(dist)) {
+                continue;
+            }
+            tmp_pool.insert(cur_neighbor, dist);
+        }
+
         if (cur_candi != cur_id) {
             results.emplace_back(cur_candi, sqr_y);
         }
