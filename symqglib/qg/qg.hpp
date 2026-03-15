@@ -202,7 +202,6 @@ inline void QuantizedGraph::update_qg(
 
     size_t words_per_vec = padded_dim_ / 64;
     std::vector<float> residual(padded_dim_, 0.0f);
-    std::vector<uint8_t> caq_codes(dimension_);
     std::vector<int> binary(padded_dim_, 0);
     std::vector<uint64_t> all_binary(cur_degree * words_per_vec, 0);
 
@@ -221,18 +220,15 @@ inline void QuantizedGraph::update_qg(
             residual[d] = nb_rotated[d] - centroid[d];
         }
 
-        // CAQ encode residual → extract MSBs
-        CaqFactors caq_fac;
-        caq_encode_single(residual.data(), dimension_, caq_codes.data(), &caq_fac);
-
+        // Sign binarization (same as baseline)
         for (size_t d = 0; d < dimension_; ++d) {
-            binary[d] = (caq_codes[d] >= 128) ? 1 : 0;
+            binary[d] = (residual[d] > 0) ? 1 : 0;
         }
         for (size_t d = dimension_; d < padded_dim_; ++d) {
             binary[d] = 0;
         }
 
-        // RaBitQ factors from CAQ-adjusted MSBs
+        // RaBitQ factors from sign bits
         rabitq_factors_single(
             residual.data(), binary.data(), centroid, dimension_,
             &triple_x[i], &fac_dq[i], &fac_vq[i]
