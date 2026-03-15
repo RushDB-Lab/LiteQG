@@ -236,4 +236,139 @@ inline float caq_l2_estimate(
     return std::max(0.0f, dist);
 }
 
+// Per-neighbor SAQ factors for fastscan distance estimation.
+// dist = sqr_y + fac_a + fac_b * width * fs_result + fac_c * vl_half + fac_d * sum_q
+struct SaqFactors {
+    float fac_a;    // ||residual||² + 2<centroid, residual>
+    float fac_b;    // -2 * rescale * delta
+    float fac_c;    // -2 * rescale * delta * sum_code
+    float fac_d;    // -2 * rescale * (0.5*delta + vmin)
+};
+
+// Encode a single vector using 4-bit CAQ (16 quantization levels).
+// Returns codes (0-15) and factors needed for SAQ distance estimation.
+inline void caq_encode_4bit(
+    const float* __restrict__ vec,
+    size_t dim,
+    uint8_t* __restrict__ code,
+    float* __restrict__ o_l2sqr_out,
+    float* __restrict__ delta_out,
+    float* __restrict__ vmin_out,
+    float* __restrict__ rescale_out,
+    float* __restrict__ sum_code_out,
+    int adj_rounds = 6
+) {
+    constexpr int code_max = 15;
+
+    float v_min = vec[0], v_max = vec[0];
+    float o_l2sqr = 0;
+    for (size_t i = 0; i < dim; ++i) {
+        v_min = std::min(v_min, vec[i]);
+        v_max = std::max(v_max, vec[i]);
+        o_l2sqr += vec[i] * vec[i];
+    }
+    *o_l2sqr_out = o_l2sqr;
+    *vmin_out = v_min;
+
+    float range = v_max - v_min;
+    if (range == 0) {
+        std::memset(code, 0, dim);
+        *delta_out = 0;
+        *rescale_out = 0;
+        *sum_code_out = 0;
+        return;
+    }
+
+    float delta = range / 16.0f;
+    *delta_out = delta;
+
+    // Initial quantization
+    double vec_sum = 0;
+    for (size_t i = 0; i < dim; ++i) {
+        vec_sum += vec[i];
+        int c = static_cast<int>((vec[i] - v_min) / delta);
+        c = std::clamp(c, 0, code_max);
+        code[i] = static_cast<uint8_t>(c);
+    }
+
+    // Compute initial <o, o_a> and ||o_a||²
+    double ip_o_oa = 0;
+    double oa_l2sqr = 0;
+    {
+        double ip_o_code = 0;
+        uint64_t code_l2sqr = 0;
+        uint32_t code_sum = 0;
+        for (size_t i = 0; i < dim; ++i) {
+            ip_o_code += static_cast<double>(code[i]) * vec[i];
+            code_l2sqr += static_cast<uint64_t>(code[i]) * code[i];
+            code_sum += code[i];
+        }
+        double d = delta;
+        double vm = v_min;
+        ip_o_oa = d * ip_o_code + (vm + 0.5 * d) * vec_sum;
+        oa_l2sqr = d * d * code_l2sqr + (d * d + 2 * d * vm) * code_sum
+                   + (0.25 * d * d + d * vm + vm * vm) * dim;
+    }
+
+    // Code adjustment — coordinate descent maximizing cosine(o, o_a)
+    if (adj_rounds > 0 && oa_l2sqr > 0) {
+        constexpr double eps = 1e-8;
+        for (int round = 0; round < adj_rounds; ++round) {
+            double re_eps = eps * oa_l2sqr;
+            int adj_count = 0;
+            for (size_t j = 0; j < dim; ++j) {
+                double o = vec[j];
+                double oa = (code[j] + 0.5) * delta + v_min;
+                uint8_t c = code[j];
+                double oa_l2sqr_rest = oa_l2sqr - oa * oa;
+                double ip_delta = delta * o;
+                while (c < code_max) {
+                    double new_oa = oa + delta;
+                    double new_length = oa_l2sqr_rest + new_oa * new_oa;
+                    double new_ip = ip_o_oa + ip_delta;
+                    if ((ip_o_oa * ip_o_oa + re_eps) * new_length
+                        >= new_ip * new_ip * oa_l2sqr)
+                        break;
+                    c++;
+                    ip_o_oa = new_ip;
+                    oa = new_oa;
+                    oa_l2sqr = new_length;
+                    adj_count++;
+                }
+                while (c > 0) {
+                    double new_oa = oa - delta;
+                    double new_length = oa_l2sqr_rest + new_oa * new_oa;
+                    double new_ip = ip_o_oa - ip_delta;
+                    if ((ip_o_oa * ip_o_oa + re_eps) * new_length
+                        >= new_ip * new_ip * oa_l2sqr)
+                        break;
+                    c--;
+                    ip_o_oa = new_ip;
+                    oa = new_oa;
+                    oa_l2sqr = new_length;
+                    adj_count++;
+                }
+                code[j] = c;
+            }
+            if (adj_count == 0)
+                break;
+            ip_o_oa = 0;
+            oa_l2sqr = 0;
+            for (size_t j = 0; j < dim; ++j) {
+                double oa = (code[j] + 0.5) * delta + v_min;
+                ip_o_oa += oa * vec[j];
+                oa_l2sqr += oa * oa;
+            }
+        }
+    }
+
+    // Compute rescale and sum_code
+    float sum_code = 0;
+    for (size_t i = 0; i < dim; ++i) {
+        sum_code += code[i];
+    }
+    *sum_code_out = sum_code;
+    *rescale_out = (ip_o_oa > 0) ? static_cast<float>(o_l2sqr / ip_o_oa) : 0;
+}
+
 }  // namespace symqg

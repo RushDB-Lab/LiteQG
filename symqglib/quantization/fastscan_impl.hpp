@@ -268,4 +268,42 @@ inline void pack_lut_impl(
         byte_query += 4;
     }
 }
+
+// --- SAQ 4-bit fastscan support ---
+
+// Build LUT for 4-bit data codes × 4-bit query values.
+// Each dimension is its own codebook with 16 entries.
+// LUT[d*16 + c] = c * byte_query[d], max = 15*16 = 240, fits uint8.
+// Total LUT size: dim * 16 bytes.
+inline void pack_lut_4bit(
+    size_t dim, const uint8_t* __restrict__ byte_query, uint8_t* __restrict__ LUT
+) {
+    for (size_t d = 0; d < dim; ++d) {
+        uint8_t q = byte_query[d];
+        for (int c = 0; c < 16; ++c) {
+            LUT[c] = static_cast<uint8_t>(c * q);
+        }
+        LUT += 16;
+    }
+}
+
+// Pack 4-bit codes into fastscan format.
+// Input: codes_per_dim[ncode * dim], each byte is one 4-bit code value (0-15).
+// Uses pack_codes_helper with fascscan_dim = dim * 4 (1 codebook per dim).
+inline void pack_codes_4bit(
+    size_t dim, const uint8_t* codes_per_dim, size_t ncode, uint8_t* blocks
+) {
+    size_t bytes_per_vec = dim / 2;
+    size_t ncode_pad = (ncode + 31) & ~31;
+    std::vector<uint8_t> packed(ncode_pad * bytes_per_vec, 0);
+    for (size_t v = 0; v < ncode; ++v) {
+        for (size_t d = 0; d < dim; d += 2) {
+            uint8_t lo = codes_per_dim[v * dim + d] & 0x0F;
+            uint8_t hi = codes_per_dim[v * dim + d + 1] & 0x0F;
+            packed[v * bytes_per_vec + d / 2] = (hi << 4) | lo;
+        }
+    }
+    pack_codes_helper(dim * 4, packed.data(), ncode, blocks);
+}
+
 }  // namespace symqg

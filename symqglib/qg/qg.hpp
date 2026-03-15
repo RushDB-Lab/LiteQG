@@ -10,7 +10,8 @@
 #include <vector>
 
 #include "../common.hpp"
-#include "../quantization/rabitq.hpp"
+#include "../quantization/caq.hpp"
+#include "../quantization/fastscan_impl.hpp"
 #include "../quantization/saq_plan.hpp"
 #include "../space/l2.hpp"
 #include "../third/ngt/hashset.hpp"
@@ -19,7 +20,6 @@
 #include "../utils/io.hpp"
 #include "../utils/memory.hpp"
 #include "../utils/pca_rotator.hpp"
-#include "../utils/rotator.hpp"
 #include "../utils/scalar_quantize.hpp"
 #include "./qg_query.hpp"
 #include "./qg_scanner.hpp"
@@ -38,9 +38,8 @@ class QuantizedGraph {
 
     PCARotator pca_rotator_;
     QuantPlan quant_plan_;
-    FHTRotator rotator_;
 
-    // Single colocated array: [raw_vec | packed_codes | factors | neighbor_IDs]
+    // Single colocated array: [raw_vec | packed_4bit_codes | factors(4) | neighbor_IDs]
     data::Array<
         float,
         std::vector<size_t>,
@@ -130,9 +129,8 @@ inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t dim)
     : num_points_(num)
     , degree_bound_(max_deg)
     , dimension_(dim)
-    , padded_dim_(1 << ceil_log2(dim))
+    , padded_dim_((dim + 63) & ~63ULL)
     , pca_rotator_(dim)
-    , rotator_(dim)
     , scanner_(padded_dim_, degree_bound_)
     , visited_(100)
     , search_pool_(0) {
@@ -143,9 +141,15 @@ inline void QuantizedGraph::initialize() {
     assert(padded_dim_ % 64 == 0);
     assert(padded_dim_ >= dimension_);
 
+    // 4-bit fascscan: fascscan_dim = padded_dim * 4 (1 codebook per dim)
+    size_t fascscan_dim = padded_dim_ * 4;
+    size_t num_blocks = (degree_bound_ + kBatchSize - 1) / kBatchSize;
+    size_t fascscan_bytes = num_blocks * fascscan_dim * 4;
+
     code_offset_ = dimension_;
-    factor_offset_ = code_offset_ + padded_dim_ / 64 * 2 * degree_bound_;
-    neighbor_offset_ = factor_offset_ + 3 * degree_bound_;
+    size_t code_size_floats = fascscan_bytes / sizeof(float);
+    factor_offset_ = code_offset_ + code_size_floats;
+    neighbor_offset_ = factor_offset_ + 4 * degree_bound_;  // 4 SAQ factors per neighbor
     row_offset_ = neighbor_offset_ + degree_bound_;
 
     data_ = data::
@@ -162,13 +166,13 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
         std::copy(src, src + dimension_, dst);
     }
 
-    // PCA fit (for eigenvalues / segmentation plan only)
+    // PCA fit
     pca_rotator_.fit(data, num_points_, dimension_);
 
     constexpr float kAvgBits = 4.0f;
     quant_plan_ = segment_dp(pca_rotator_.eigenvalues().data(), dimension_, kAvgBits);
 
-    std::cout << "\tVectors Copied\n";
+    std::cout << "\tVectors Copied, PCA Fitted\n";
 }
 
 inline void QuantizedGraph::update_qg(
@@ -185,35 +189,59 @@ inline void QuantizedGraph::update_qg(
         neighbor_ptr[i] = new_neighbors[i].id;
     }
 
-    // Rotate centroid (cur_id's raw vector) and all neighbors on-the-fly
-    RowMatrix<float> x_pad(cur_degree, padded_dim_);
-    RowMatrix<float> c_pad(1, padded_dim_);
-    x_pad.setZero();
-    c_pad.setZero();
+    // PCA rotate centroid and all neighbors on-the-fly
+    std::vector<float> centroid_rot(padded_dim_, 0.0f);
+    pca_rotator_.rotate(get_vector(cur_id), centroid_rot.data());
+
+    std::vector<float> nb_rot(padded_dim_, 0.0f);
+    std::vector<float> residual(padded_dim_, 0.0f);
+    std::vector<uint8_t> codes_4bit(padded_dim_);
+    std::vector<uint8_t> all_codes(cur_degree * padded_dim_, 0);
+
+    float* fac_ptr = get_factor(cur_id);
+    float* fac_a = fac_ptr;
+    float* fac_b = fac_a + degree_bound_;
+    float* fac_c = fac_b + degree_bound_;
+    float* fac_d = fac_c + degree_bound_;
 
     for (size_t i = 0; i < cur_degree; ++i) {
-        auto neighbor_id = new_neighbors[i].id;
-        const auto* cur_data = get_vector(neighbor_id);
-        std::copy(cur_data, cur_data + dimension_, &x_pad(static_cast<long>(i), 0));
-    }
-    const auto* cur_cent = get_vector(cur_id);
-    std::copy(cur_cent, cur_cent + dimension_, &c_pad(0, 0));
+        PID nb_id = new_neighbors[i].id;
 
-    RowMatrix<float> x_rotated(cur_degree, padded_dim_);
-    RowMatrix<float> c_rotated(1, padded_dim_);
-    for (long i = 0; i < static_cast<long>(cur_degree); ++i) {
-        this->rotator_.rotate(&x_pad(i, 0), &x_rotated(i, 0));
-    }
-    this->rotator_.rotate(&c_pad(0, 0), &c_rotated(0, 0));
+        // PCA rotate neighbor
+        std::fill(nb_rot.begin(), nb_rot.end(), 0.0f);
+        pca_rotator_.rotate(get_vector(nb_id), nb_rot.data());
 
-    // Get codes and factors for RaBitQ
-    float* fac_ptr = get_factor(cur_id);
-    float* triple_x = fac_ptr;
-    float* factor_dq = triple_x + this->degree_bound_;
-    float* factor_vq = factor_dq + this->degree_bound_;
-    rabitq_codes(
-        x_rotated, c_rotated, get_packed_code(cur_id), triple_x, factor_dq, factor_vq
-    );
+        // Residual = neighbor_rotated - centroid_rotated
+        for (size_t d = 0; d < padded_dim_; ++d) {
+            residual[d] = nb_rot[d] - centroid_rot[d];
+        }
+
+        // CAQ 4-bit encode residual
+        float o_l2sqr, delta, vmin, rescale, sum_code;
+        caq_encode_4bit(
+            residual.data(), padded_dim_, codes_4bit.data(),
+            &o_l2sqr, &delta, &vmin, &rescale, &sum_code, 6
+        );
+
+        // Copy codes for later packing
+        std::memcpy(&all_codes[i * padded_dim_], codes_4bit.data(), padded_dim_);
+
+        // Compute <centroid_rotated, residual>
+        float ip_c_r = 0;
+        for (size_t d = 0; d < padded_dim_; ++d) {
+            ip_c_r += centroid_rot[d] * residual[d];
+        }
+
+        // SAQ factors:
+        // dist = sqr_y + fac_a + fac_b * width * fs_result + fac_c * vl_half + fac_d * sum_q
+        fac_a[i] = o_l2sqr + 2.0f * ip_c_r;
+        fac_b[i] = -2.0f * rescale * delta;
+        fac_c[i] = -2.0f * rescale * delta * sum_code;
+        fac_d[i] = -2.0f * rescale * (0.5f * delta + vmin);
+    }
+
+    // Pack 4-bit codes into fascscan format
+    pack_codes_4bit(padded_dim_, all_codes.data(), cur_degree, get_packed_code(cur_id));
 }
 
 inline float QuantizedGraph::scan_neighbors(
@@ -231,9 +259,9 @@ inline float QuantizedGraph::scan_neighbors(
         appro_dist,
         q_obj.lut().data(),
         sqr_y,
-        q_obj.lower_val(),
         q_obj.width(),
-        q_obj.sumq(),
+        q_obj.vl_half(),
+        q_obj.sum_q_float(),
         packed_code,
         factor
     );
@@ -285,9 +313,8 @@ inline void QuantizedGraph::search(
     this->visited_.clear();
     this->search_pool_.clear();
 
-    // Query preparation: FHT rotate → quantize → build LUT
     QGQuery q_obj(query, padded_dim_);
-    q_obj.query_prepare(rotator_, scanner_);
+    q_obj.query_prepare(pca_rotator_, scanner_);
 
     search_pool_.insert(this->entry_point_, FLT_MAX);
     buffer::ResultBuffer res_pool(knn);
@@ -323,7 +350,7 @@ inline void QuantizedGraph::find_candidates(
 ) const {
     const float* query = get_vector(cur_id);
     QGQuery q_obj(query, padded_dim_);
-    q_obj.query_prepare(rotator_, scanner_);
+    q_obj.query_prepare(pca_rotator_, scanner_);
 
     buffer::SearchBuffer tmp_pool(search_ef);
     tmp_pool.insert(this->entry_point_, 1e10);
@@ -359,17 +386,15 @@ inline void QuantizedGraph::save_index(const char* filename) const {
     assert(output.is_open());
 
     output.write(reinterpret_cast<const char*>(&entry_point_), sizeof(PID));
-    data_.save(output);
-    rotator_.save(output);
-
-    // Save PCA rotator + quant plan for future use
     pca_rotator_.save(output);
+
     size_t plan_size = quant_plan_.size();
     output.write(reinterpret_cast<const char*>(&plan_size), sizeof(size_t));
     for (auto& seg : quant_plan_) {
         output.write(reinterpret_cast<const char*>(&seg), sizeof(QuantSegment));
     }
 
+    data_.save(output);
     output.close();
     std::cout << "\tQuantized graph saved!\n";
 }
@@ -382,33 +407,20 @@ inline void QuantizedGraph::load_index(const char* filename) {
         abort();
     }
 
-    size_t filesize = get_filesize(filename);
-    size_t base_size = sizeof(PID) + (sizeof(float) * num_points_ * row_offset_) +
-                       (sizeof(float) * padded_dim_);
-    // Allow larger files due to extra PCA/plan data
-    if (filesize < base_size) {
-        std::cerr << "Index file size error!\n";
-        abort();
-    }
-
     std::ifstream input(filename, std::ios::binary);
     assert(input.is_open());
 
     input.read(reinterpret_cast<char*>(&entry_point_), sizeof(PID));
-    data_.load(input);
-    rotator_.load(input);
+    pca_rotator_.load(input);
 
-    // Load PCA rotator + quant plan if present
-    if (input.peek() != EOF) {
-        pca_rotator_.load(input);
-        size_t plan_size = 0;
-        input.read(reinterpret_cast<char*>(&plan_size), sizeof(size_t));
-        quant_plan_.resize(plan_size);
-        for (auto& seg : quant_plan_) {
-            input.read(reinterpret_cast<char*>(&seg), sizeof(QuantSegment));
-        }
+    size_t plan_size = 0;
+    input.read(reinterpret_cast<char*>(&plan_size), sizeof(size_t));
+    quant_plan_.resize(plan_size);
+    for (auto& seg : quant_plan_) {
+        input.read(reinterpret_cast<char*>(&seg), sizeof(QuantSegment));
     }
 
+    data_.load(input);
     input.close();
     std::cout << "Quantized graph loaded!\n";
 }
