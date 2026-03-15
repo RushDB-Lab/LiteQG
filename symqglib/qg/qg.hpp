@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "../common.hpp"
-#include "../quantization/caq.hpp"
 #include "../quantization/rabitq.hpp"
 #include "../quantization/saq_plan.hpp"
 #include "../space/bitwise.hpp"
@@ -21,6 +20,7 @@
 #include "../utils/io.hpp"
 #include "../utils/memory.hpp"
 #include "../utils/pca_rotator.hpp"
+#include "../utils/rotator.hpp"
 #include "../utils/scalar_quantize.hpp"
 #include "./qg_query.hpp"
 #include "./qg_scanner.hpp"
@@ -39,6 +39,7 @@ class QuantizedGraph {
 
     PCARotator pca_rotator_;
     QuantPlan quant_plan_;
+    FHTRotator rotator_;
 
     // Single colocated array: [raw_vec | packed_codes | factors | neighbor_IDs]
     data::Array<
@@ -51,7 +52,7 @@ class QuantizedGraph {
     HashBasedBooleanSet visited_;
     buffer::SearchBuffer search_pool_;
 
-    // Build-time only: rotated vectors [N * dim], freed after build
+    // Build-time only: FHT-rotated vectors [N * padded_dim_], freed after build
     std::vector<float> rotated_vecs_;
 
     // Offsets within each row (float units)
@@ -133,8 +134,9 @@ inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t dim)
     : num_points_(num)
     , degree_bound_(max_deg)
     , dimension_(dim)
-    , padded_dim_((dim + 63) & ~63ULL)
+    , padded_dim_(1 << ceil_log2(dim))
     , pca_rotator_(dim)
+    , rotator_(dim)
     , scanner_(padded_dim_, degree_bound_)
     , visited_(100)
     , search_pool_(0) {
@@ -164,23 +166,24 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
         std::copy(src, src + dimension_, dst);
     }
 
-    // PCA fit
+    // PCA fit (for eigenvalues / segmentation plan only)
     pca_rotator_.fit(data, num_points_, dimension_);
 
-    // Segmentation plan (stored for future variable-bit use)
     constexpr float kAvgBits = 4.0f;
     quant_plan_ = segment_dp(pca_rotator_.eigenvalues().data(), dimension_, kAvgBits);
 
-    // Rotate all vectors → rotated_vecs_ (build-time storage)
-    rotated_vecs_.resize(num_points_ * dimension_);
+    // FHT-rotate all vectors → rotated_vecs_ (build-time, padded_dim_ per vector)
+    rotated_vecs_.resize(num_points_ * padded_dim_);
 
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
         const float* raw_vec = data + i * dimension_;
-        pca_rotator_.rotate(raw_vec, &rotated_vecs_[i * dimension_]);
+        float* dst = &rotated_vecs_[i * padded_dim_];
+        // FHTRotator::rotate pads to padded_dim_ and applies FHT
+        rotator_.rotate(raw_vec, dst);
     }
 
-    std::cout << "\tVectors Copied, PCA Rotated\n";
+    std::cout << "\tVectors Copied, FHT Rotated\n";
 }
 
 inline void QuantizedGraph::update_qg(
@@ -197,8 +200,8 @@ inline void QuantizedGraph::update_qg(
         neighbor_ptr[i] = new_neighbors[i].id;
     }
 
-    // Per-node centroid = rotated_vecs_[cur_id]
-    const float* centroid = &rotated_vecs_[cur_id * dimension_];
+    // Per-node centroid = rotated_vecs_[cur_id] (in FHT-rotated space)
+    const float* centroid = &rotated_vecs_[cur_id * padded_dim_];
 
     size_t words_per_vec = padded_dim_ / 64;
     std::vector<float> residual(padded_dim_, 0.0f);
@@ -212,25 +215,21 @@ inline void QuantizedGraph::update_qg(
 
     for (size_t i = 0; i < cur_degree; ++i) {
         PID nb_id = new_neighbors[i].id;
-        const float* nb_rotated = &rotated_vecs_[nb_id * dimension_];
+        const float* nb_rotated = &rotated_vecs_[nb_id * padded_dim_];
 
-        // Compute residual = neighbor - centroid, padded to padded_dim_
-        std::fill(residual.begin(), residual.end(), 0.0f);
-        for (size_t d = 0; d < dimension_; ++d) {
+        // Residual = rotated_neighbor - rotated_centroid
+        for (size_t d = 0; d < padded_dim_; ++d) {
             residual[d] = nb_rotated[d] - centroid[d];
         }
 
-        // Sign binarization (same as baseline)
-        for (size_t d = 0; d < dimension_; ++d) {
+        // Sign binarization
+        for (size_t d = 0; d < padded_dim_; ++d) {
             binary[d] = (residual[d] > 0) ? 1 : 0;
         }
-        for (size_t d = dimension_; d < padded_dim_; ++d) {
-            binary[d] = 0;
-        }
 
-        // RaBitQ factors from sign bits
+        // RaBitQ factors (use padded_dim_ as the effective dimension)
         rabitq_factors_single(
-            residual.data(), binary.data(), centroid, dimension_,
+            residual.data(), binary.data(), centroid, padded_dim_,
             &triple_x[i], &fac_dq[i], &fac_vq[i]
         );
 
@@ -311,16 +310,12 @@ inline void QuantizedGraph::search(
     this->visited_.clear();
     this->search_pool_.clear();
 
-    // Query preparation: PCA rotate → quantize → build LUT
+    // Query preparation: FHT rotate → quantize → build LUT
     QGQuery q_obj(query, padded_dim_);
-    q_obj.query_prepare(pca_rotator_, scanner_);
+    q_obj.query_prepare(rotator_, scanner_);
 
-    // Searching pool initialization
     search_pool_.insert(this->entry_point_, FLT_MAX);
-
-    // Result pool
     buffer::ResultBuffer res_pool(knn);
-
     std::vector<float> appro_dist(degree_bound_);
 
     while (search_pool_.has_next()) {
@@ -353,7 +348,7 @@ inline void QuantizedGraph::find_candidates(
 ) const {
     const float* query = get_vector(cur_id);
     QGQuery q_obj(query, padded_dim_);
-    q_obj.query_prepare(pca_rotator_, scanner_);
+    q_obj.query_prepare(rotator_, scanner_);
 
     buffer::SearchBuffer tmp_pool(search_ef);
     tmp_pool.insert(this->entry_point_, 1e10);
@@ -389,19 +384,16 @@ inline void QuantizedGraph::save_index(const char* filename) const {
     assert(output.is_open());
 
     output.write(reinterpret_cast<const char*>(&entry_point_), sizeof(PID));
+    data_.save(output);
+    rotator_.save(output);
 
-    // Save PCA rotator
+    // Save PCA rotator + quant plan for future use
     pca_rotator_.save(output);
-
-    // Save quant plan
     size_t plan_size = quant_plan_.size();
     output.write(reinterpret_cast<const char*>(&plan_size), sizeof(size_t));
     for (auto& seg : quant_plan_) {
         output.write(reinterpret_cast<const char*>(&seg), sizeof(QuantSegment));
     }
-
-    // Save data array
-    data_.save(output);
 
     output.close();
     std::cout << "\tQuantized graph saved!\n";
@@ -415,24 +407,32 @@ inline void QuantizedGraph::load_index(const char* filename) {
         abort();
     }
 
+    size_t filesize = get_filesize(filename);
+    size_t base_size = sizeof(PID) + (sizeof(float) * num_points_ * row_offset_) +
+                       (sizeof(float) * padded_dim_);
+    // Allow larger files due to extra PCA/plan data
+    if (filesize < base_size) {
+        std::cerr << "Index file size error!\n";
+        abort();
+    }
+
     std::ifstream input(filename, std::ios::binary);
     assert(input.is_open());
 
     input.read(reinterpret_cast<char*>(&entry_point_), sizeof(PID));
-
-    // Load PCA rotator
-    pca_rotator_.load(input);
-
-    // Load quant plan
-    size_t plan_size = 0;
-    input.read(reinterpret_cast<char*>(&plan_size), sizeof(size_t));
-    quant_plan_.resize(plan_size);
-    for (auto& seg : quant_plan_) {
-        input.read(reinterpret_cast<char*>(&seg), sizeof(QuantSegment));
-    }
-
-    // Load data array
     data_.load(input);
+    rotator_.load(input);
+
+    // Load PCA rotator + quant plan if present
+    if (input.peek() != EOF) {
+        pca_rotator_.load(input);
+        size_t plan_size = 0;
+        input.read(reinterpret_cast<char*>(&plan_size), sizeof(size_t));
+        quant_plan_.resize(plan_size);
+        for (auto& seg : quant_plan_) {
+            input.read(reinterpret_cast<char*>(&seg), sizeof(QuantSegment));
+        }
+    }
 
     input.close();
     std::cout << "Quantized graph loaded!\n";

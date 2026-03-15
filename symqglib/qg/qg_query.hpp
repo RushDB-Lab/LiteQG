@@ -4,7 +4,7 @@
 
 #include "../common.hpp"
 #include "../utils/memory.hpp"
-#include "../utils/pca_rotator.hpp"
+#include "../utils/rotator.hpp"
 #include "../utils/scalar_quantize.hpp"
 #include "./qg_scanner.hpp"
 
@@ -25,8 +25,8 @@ class QGQuery {
         , lut_(padded_dim << 2)  // padded_dim / 4 * 16
         , padded_dim_(padded_dim) {}
 
-    void query_prepare(const PCARotator& rotator, const QGScanner& scanner) {
-        // PCA rotate query into padded buffer (zero-initialized by AlignedAllocator)
+    void query_prepare(const FHTRotator& rotator, const QGScanner& scanner) {
+        // rotate query
         std::vector<float, memory::AlignedAllocator<float>> rd_query(padded_dim_);
         rotator.rotate(query_data_, rd_query.data());
 
