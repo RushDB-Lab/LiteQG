@@ -88,8 +88,9 @@ class QGBuilder {
             iter(false);
         }
         iter(true);
-        // Copy final neighbor IDs into qdata_ for colocated query access
-        qg_.finalize_index();
+        // Free build-time rotated vectors
+        qg_.rotated_vecs_.clear();
+        qg_.rotated_vecs_.shrink_to_fit();
     }
 
     void check_dup() const {
@@ -210,7 +211,7 @@ inline void QGBuilder::search_new_neighbors(bool refine) {
         HashBasedBooleanSet& vis = visited_list_[tid];
         candidates.reserve(2 * max_candidate_pool_size_);
         vis.clear();
-        qg_.find_candidates_approx(cur_id, ef_build_, candidates, vis, degrees_);
+        qg_.find_candidates(cur_id, ef_build_, candidates, vis, degrees_);
 
         // add current neighbors
         for (auto& nei : new_neighbors_[cur_id]) {
