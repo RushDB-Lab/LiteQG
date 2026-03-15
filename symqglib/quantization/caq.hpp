@@ -10,15 +10,17 @@
 
 namespace symqg {
 
-// Per-vector CAQ factors stored alongside codes in qdata_
+// Per-vector CAQ factors for asymmetric quantization.
+// Distance: est_ip = fac_dot * dot(code, q) + fac_sum * sum_q
+//           dist   = o_l2sqr + q_l2sqr - 2 * est_ip
 struct CaqFactors {
-    float o_l2sqr;      // ||o||²
-    float fac_rescale;   // (||o||² / <o, o_a>) * v_max  (after v_max normalization)
+    float o_l2sqr;   // ||o||²
+    float fac_dot;   // rescale * delta
+    float fac_sum;   // rescale * (0.5 * delta + vmin)
 };
 
 // Encode a single vector using CAQ (Code Adjustment Quantization).
-// Codes are uint8 in [0, 255]. After v_max normalization, all vectors share
-// delta = 2/256, so distance estimation needs no per-vector delta.
+// Codes are uint8 in [0, 255] with asymmetric [vmin, vmax] range per vector.
 inline void caq_encode_single(
     const float* __restrict__ vec,
     size_t dim,
@@ -28,24 +30,25 @@ inline void caq_encode_single(
 ) {
     constexpr int code_max = 255;
 
-    // Step 1: compute v_max and ||o||²
-    float v_max = 0;
+    // Step 1: compute vmin, vmax and ||o||²
+    float v_min = vec[0], v_max = vec[0];
     float o_l2sqr = 0;
     for (size_t i = 0; i < dim; ++i) {
-        float absv = std::abs(vec[i]);
-        v_max = std::max(v_max, absv);
+        v_min = std::min(v_min, vec[i]);
+        v_max = std::max(v_max, vec[i]);
         o_l2sqr += vec[i] * vec[i];
     }
     factors->o_l2sqr = o_l2sqr;
 
-    if (v_max == 0) {
+    float range = v_max - v_min;
+    if (range == 0) {
         std::memset(code, 0, dim);
-        factors->fac_rescale = 0;
+        factors->fac_dot = 0;
+        factors->fac_sum = 0;
         return;
     }
 
-    float v_min = -v_max;
-    float delta = (v_max - v_min) / 256.0f;  // 2*v_max/256
+    float delta = range / 256.0f;
 
     // Step 2: initial LVQ quantization (floor)
     double ip_o_oa = 0;
@@ -137,13 +140,17 @@ inline void caq_encode_single(
         }
     }
 
-    // Step 4: compute fac_rescale with v_max absorbed
-    // fac_rescale = (||o||² / <o, o_a>) * v_max
-    // After v_max normalization, delta becomes 2/256 for all vectors.
+    // Step 4: compute asymmetric factors
+    // rescale = ||o||² / <o, o_a>
+    // est_ip = rescale * <o_a, q> = rescale * (delta * dot(code, q) + (0.5*delta + vmin) * sum_q)
+    //        = fac_dot * dot(code, q) + fac_sum * sum_q
     if (ip_o_oa > 0) {
-        factors->fac_rescale = static_cast<float>((o_l2sqr / ip_o_oa) * v_max);
+        double rescale = o_l2sqr / ip_o_oa;
+        factors->fac_dot = static_cast<float>(rescale * delta);
+        factors->fac_sum = static_cast<float>(rescale * (0.5 * delta + v_min));
     } else {
-        factors->fac_rescale = 0;
+        factors->fac_dot = 0;
+        factors->fac_sum = 0;
     }
 }
 
@@ -212,15 +219,9 @@ inline float caq_dot_u8f32(
     return result;
 }
 
-// Estimate L2² distance using CAQ codes.
-//
-// After v_max normalization to 1 for all vectors:
-//   delta_norm = 2/256 = 1/128
-//   o_a_norm[i] = (code[i] + 0.5) * delta_norm - 1
-//
-//   <o_a_norm, q> = delta_norm * Σ code[i]*q[i] + (0.5*delta_norm - 1) * sum_q
-//   <o, q> ≈ fac_rescale * <o_a_norm, q>
-//   dist = ||o||² + ||q||² - 2 * <o, q>
+// Estimate L2² distance using asymmetric CAQ codes.
+//   <o, q> ≈ fac_dot * dot(code, q) + fac_sum * sum_q
+//   dist = o_l2sqr + q_l2sqr - 2 * est_ip
 inline float caq_l2_estimate(
     const float* __restrict__ query,
     const uint8_t* __restrict__ code,
@@ -229,12 +230,8 @@ inline float caq_l2_estimate(
     float sum_q,
     size_t dim
 ) {
-    constexpr float delta_norm = 2.0f / 256.0f;     // 1/128
-    constexpr float offset = 0.5f * delta_norm - 1.0f;  // -255/256
-
     float raw_dot = caq_dot_u8f32(code, query, dim);
-    float oa_q_ip = delta_norm * raw_dot + offset * sum_q;
-    float est_ip = factors->fac_rescale * oa_q_ip;
+    float est_ip = factors->fac_dot * raw_dot + factors->fac_sum * sum_q;
     float dist = factors->o_l2sqr + q_l2sqr - 2.0f * est_ip;
     return std::max(0.0f, dist);
 }
