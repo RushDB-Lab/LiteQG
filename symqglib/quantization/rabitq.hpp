@@ -106,4 +106,36 @@ static inline void rabitq_factors(
         );
     }
 }
+// Per-vector RaBitQ factors without Eigen dependency.
+// Used for fastscan: binary codes + appro_dist_impl formula.
+inline void rabitq_factors_single(
+    const float* centered,    // centered rotated vector (x - centroid)
+    const int* binary,        // 0/1 array, dim ints
+    const float* centroid,    // global centroid
+    size_t dim,
+    float* triple_x, float* fac_dq, float* fac_vq
+) {
+    float fac_norm = 1.f / std::sqrt(static_cast<float>(dim));
+    float x_norm_sq = 0;
+    float dot_cs = 0;
+    float dot_cent_s = 0;
+    int bin_sum = 0;
+    for (size_t d = 0; d < dim; ++d) {
+        float s = 2.f * binary[d] - 1.f;
+        x_norm_sq += centered[d] * centered[d];
+        dot_cs += centered[d] * s;
+        dot_cent_s += centroid[d] * s;
+        bin_sum += binary[d];
+    }
+    float x_norm = std::sqrt(x_norm_sq);
+    float fac_x0 = dot_cs * fac_norm / x_norm;
+    if (std::abs(fac_x0) < 1e-8f) fac_x0 = 1e-8f;
+    double x_x0 = static_cast<double>(x_norm) / fac_x0;
+    float x1 = dot_cent_s * fac_norm;
+
+    *triple_x = static_cast<float>(x_norm_sq + 2.0 * x_x0 * x1);
+    *fac_dq   = static_cast<float>(-2.0 * x_x0 * fac_norm);
+    *fac_vq   = static_cast<float>(-2.0 * x_x0 * fac_norm * (2 * bin_sum - static_cast<int>(dim)));
+}
+
 }  // namespace symqg

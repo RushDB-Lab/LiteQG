@@ -12,6 +12,7 @@
 
 #include "../common.hpp"
 #include "../quantization/caq.hpp"
+#include "../quantization/rabitq.hpp"
 #include "../quantization/saq_plan.hpp"
 #include "../space/l2.hpp"
 #include "../third/ngt/hashset.hpp"
@@ -20,6 +21,8 @@
 #include "../utils/io.hpp"
 #include "../utils/memory.hpp"
 #include "../utils/pca_rotator.hpp"
+#include "../utils/scalar_quantize.hpp"
+#include "./qg_scanner.hpp"
 
 namespace symqg {
 
@@ -38,8 +41,28 @@ class QuantizedGraph {
     // Segmentation plan from DP (Phase 2, stored for future use)
     QuantPlan quant_plan_;
 
-    // Per-vector CAQ factors
+    // Per-vector CAQ factors (System B: accurate re-score)
     std::vector<CaqFactors> caq_factors_;
+
+    // Per-vector CAQ codes in centered-rotated space [N * dim bytes]
+    std::vector<uint8_t> vec_codes_;
+
+    // Rotated-space centroid [dim floats]
+    std::vector<float> centroid_;
+
+    // Padded dimension (rounded up to 64 for binary packing)
+    size_t padded_dim_ = 0;
+
+    // Per-vector RaBitQ factors (System A: fastscan)
+    std::vector<float> fast_triple_x_;
+    std::vector<float> fast_fac_dq_;
+    std::vector<float> fast_fac_vq_;
+
+    // Per-vector packed binary codes [N][padded_dim/64 uint64s]
+    std::vector<std::vector<uint64_t>> binary_packed_;
+
+    // Fastscan scanner
+    QGScanner scanner_;
 
     // Build-time: raw vectors + neighbor IDs
     //   Layout: [raw_vec (dimension_ floats) | neighbor_IDs (degree_bound_ PIDs)]
@@ -49,8 +72,9 @@ class QuantizedGraph {
         memory::AlignedAllocator<float, 1 << 22, true>>
         data_;
 
-    // Query-time: CAQ codes (in rotated space) + neighbor IDs colocated
-    //   Layout: [caq_code (dimension_ bytes) | neighbor_IDs (degree_bound_ * 4 bytes)]
+    // Query-time: fastscan packed codes + RaBitQ factors + neighbor IDs (colocated)
+    //   Layout per node:
+    //   [packed_fastscan_codes | triple_x[deg] | fac_dq[deg] | fac_vq[deg] | neighbor_IDs[deg]]
     data::Array<
         uint8_t,
         std::vector<size_t>,
@@ -65,8 +89,10 @@ class QuantizedGraph {
     size_t row_offset_ = 0;
 
     // Offsets for qdata_ (query-time, byte units)
-    size_t q_neighbor_offset_ = 0;
-    size_t q_row_offset_ = 0;
+    size_t fastscan_bytes_ = 0;    // packed fastscan codes size per node
+    size_t q_factors_offset_ = 0;  // offset to triple_x array
+    size_t q_neighbor_offset_ = 0; // offset to neighbor IDs
+    size_t q_row_offset_ = 0;      // total bytes per node
     size_t q_prefetch_lines_ = 0;
 
     void initialize();
@@ -91,8 +117,13 @@ class QuantizedGraph {
     }
 
     // Query-time accessors (qdata_, colocated layout)
-    [[nodiscard]] const uint8_t* get_qvector(PID data_id) const {
+    [[nodiscard]] const uint8_t* get_qcodes(PID data_id) const {
         return &qdata_.at(q_row_offset_ * data_id);
+    }
+    [[nodiscard]] const float* get_qfactors(PID data_id) const {
+        return reinterpret_cast<const float*>(
+            &qdata_.at(q_row_offset_ * data_id + q_factors_offset_)
+        );
     }
     [[nodiscard]] const PID* get_qneighbors(PID data_id) const {
         return reinterpret_cast<const PID*>(
@@ -149,42 +180,114 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
     constexpr float kAvgBits = 4.0f;
     quant_plan_ = segment_dp(pca_rotator_.eigenvalues().data(), dimension_, kAvgBits);
 
-    // Rotate all vectors and CAQ-encode into qdata_
-    std::vector<uint8_t> tmp_codes(num_points_ * dimension_);
+    // Rotate all vectors and compute centroid in rotated space
+    std::vector<float> all_rotated(num_points_ * dimension_);
 
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
         const float* raw_vec = data + i * dimension_;
-        std::vector<float> rotated(dimension_);
-        pca_rotator_.rotate(raw_vec, rotated.data());
-        caq_encode_single(
-            rotated.data(), dimension_,
-            &tmp_codes[i * dimension_], &caq_factors_[i]
-        );
+        pca_rotator_.rotate(raw_vec, &all_rotated[i * dimension_]);
     }
 
-    // Scatter codes into qdata_ rows
+    // Compute centroid = mean of rotated vectors
+    centroid_.assign(dimension_, 0.0f);
+    for (size_t i = 0; i < num_points_; ++i) {
+        for (size_t d = 0; d < dimension_; ++d) {
+            centroid_[d] += all_rotated[i * dimension_ + d];
+        }
+    }
+    float inv_n = 1.0f / static_cast<float>(num_points_);
+    for (size_t d = 0; d < dimension_; ++d) {
+        centroid_[d] *= inv_n;
+    }
+
+    // System B (accurate): CAQ encode centered vectors
+    vec_codes_.resize(num_points_ * dimension_);
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
-        std::memcpy(
-            &qdata_.at(q_row_offset_ * i),
-            &tmp_codes[dimension_ * i],
-            dimension_
+        std::vector<float> centered(dimension_);
+        for (size_t d = 0; d < dimension_; ++d) {
+            centered[d] = all_rotated[i * dimension_ + d] - centroid_[d];
+        }
+        caq_encode_single(
+            centered.data(), dimension_,
+            &vec_codes_[i * dimension_], &caq_factors_[i]
         );
     }
 
-    std::cout << "\tVectors Copied, PCA Rotated, CAQ Encoded (asymmetric)\n";
+    // System A (fast): binarize centered vectors + compute RaBitQ factors
+    size_t words_per_vec = padded_dim_ / 64;
+    fast_triple_x_.resize(num_points_);
+    fast_fac_dq_.resize(num_points_);
+    fast_fac_vq_.resize(num_points_);
+    binary_packed_.resize(num_points_);
+
+#pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_points_; ++i) {
+        std::vector<float> centered(padded_dim_, 0.0f);
+        std::vector<int> binary(padded_dim_, 0);
+        for (size_t d = 0; d < dimension_; ++d) {
+            centered[d] = all_rotated[i * dimension_ + d] - centroid_[d];
+            binary[d] = (centered[d] > 0) ? 1 : 0;
+        }
+
+        rabitq_factors_single(
+            centered.data(), binary.data(), centroid_.data(), dimension_,
+            &fast_triple_x_[i], &fast_fac_dq_[i], &fast_fac_vq_[i]
+        );
+
+        binary_packed_[i].resize(words_per_vec);
+        space::pack_binary(binary.data(), binary_packed_[i].data(), padded_dim_);
+    }
+
+    std::cout << "\tVectors Copied, PCA Rotated, Centered, CAQ + RaBitQ Encoded\n";
 }
 
 inline void QuantizedGraph::finalize_index() {
-    // Copy neighbor IDs from data_ to qdata_ for colocated query access
+    // Build qdata_ with fastscan layout per node
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
-        const PID* src = get_neighbors(i);
-        uint8_t* dst = &qdata_.at(q_row_offset_ * i + q_neighbor_offset_);
-        std::memcpy(dst, src, degree_bound_ * sizeof(PID));
+        const PID* src_nb = get_neighbors(i);
+        uint8_t* qrow = &qdata_.at(q_row_offset_ * i);
+
+        // Gather binary codes of neighbors and pack for fastscan
+        size_t words_per_vec = padded_dim_ / 64;
+        std::vector<uint64_t> gathered(degree_bound_ * words_per_vec, 0);
+        for (size_t nb = 0; nb < degree_bound_; ++nb) {
+            PID nb_id = src_nb[nb];
+            std::memcpy(
+                &gathered[nb * words_per_vec],
+                binary_packed_[nb_id].data(),
+                words_per_vec * sizeof(uint64_t)
+            );
+        }
+        pack_codes(padded_dim_, gathered.data(), degree_bound_, qrow);
+
+        // Write RaBitQ factors: [triple_x | fac_dq | fac_vq]
+        float* factors = reinterpret_cast<float*>(qrow + q_factors_offset_);
+        for (size_t nb = 0; nb < degree_bound_; ++nb) {
+            PID nb_id = src_nb[nb];
+            factors[nb] = fast_triple_x_[nb_id];
+            factors[degree_bound_ + nb] = fast_fac_dq_[nb_id];
+            factors[2 * degree_bound_ + nb] = fast_fac_vq_[nb_id];
+        }
+
+        // Write neighbor IDs
+        PID* dst_nb = reinterpret_cast<PID*>(qrow + q_neighbor_offset_);
+        std::memcpy(dst_nb, src_nb, degree_bound_ * sizeof(PID));
     }
-    std::cout << "\tIndex finalized (neighbors colocated)\n";
+
+    // Free build-time binary data (no longer needed)
+    binary_packed_.clear();
+    binary_packed_.shrink_to_fit();
+    fast_triple_x_.clear();
+    fast_triple_x_.shrink_to_fit();
+    fast_fac_dq_.clear();
+    fast_fac_dq_.shrink_to_fit();
+    fast_fac_vq_.clear();
+    fast_fac_vq_.shrink_to_fit();
+
+    std::cout << "\tIndex finalized (fastscan packed + factors + neighbors colocated)\n";
 }
 
 inline void QuantizedGraph::save_index(const char* filename) const {
@@ -201,12 +304,34 @@ inline void QuantizedGraph::save_index(const char* filename) const {
         output.write(reinterpret_cast<const char*>(&seg), sizeof(QuantSegment));
     }
 
+    // Save centroid
+    output.write(
+        reinterpret_cast<const char*>(centroid_.data()),
+        static_cast<std::streamsize>(dimension_ * sizeof(float))
+    );
+
+    // Save padded_dim and layout offsets
+    output.write(reinterpret_cast<const char*>(&padded_dim_), sizeof(size_t));
+    output.write(reinterpret_cast<const char*>(&fastscan_bytes_), sizeof(size_t));
+    output.write(reinterpret_cast<const char*>(&q_factors_offset_), sizeof(size_t));
+    output.write(reinterpret_cast<const char*>(&q_neighbor_offset_), sizeof(size_t));
+    output.write(reinterpret_cast<const char*>(&q_row_offset_), sizeof(size_t));
+
     data_.save(output);
     qdata_.save(output);
+
+    // Save CAQ factors
     output.write(
         reinterpret_cast<const char*>(caq_factors_.data()),
         static_cast<std::streamsize>(num_points_ * sizeof(CaqFactors))
     );
+
+    // Save per-vector CAQ codes
+    output.write(
+        reinterpret_cast<const char*>(vec_codes_.data()),
+        static_cast<std::streamsize>(num_points_ * dimension_)
+    );
+
     output.close();
 }
 
@@ -225,12 +350,41 @@ inline void QuantizedGraph::load_index(const char* filename) {
         input.read(reinterpret_cast<char*>(&seg), sizeof(QuantSegment));
     }
 
+    // Load centroid
+    centroid_.resize(dimension_);
+    input.read(
+        reinterpret_cast<char*>(centroid_.data()),
+        static_cast<std::streamsize>(dimension_ * sizeof(float))
+    );
+
+    // Load padded_dim and layout offsets
+    input.read(reinterpret_cast<char*>(&padded_dim_), sizeof(size_t));
+    input.read(reinterpret_cast<char*>(&fastscan_bytes_), sizeof(size_t));
+    input.read(reinterpret_cast<char*>(&q_factors_offset_), sizeof(size_t));
+    input.read(reinterpret_cast<char*>(&q_neighbor_offset_), sizeof(size_t));
+    input.read(reinterpret_cast<char*>(&q_row_offset_), sizeof(size_t));
+
     data_.load(input);
     qdata_.load(input);
+
+    // Load CAQ factors
     input.read(
         reinterpret_cast<char*>(caq_factors_.data()),
         static_cast<std::streamsize>(num_points_ * sizeof(CaqFactors))
     );
+
+    // Load per-vector CAQ codes
+    vec_codes_.resize(num_points_ * dimension_);
+    input.read(
+        reinterpret_cast<char*>(vec_codes_.data()),
+        static_cast<std::streamsize>(num_points_ * dimension_)
+    );
+
+    // Reconstruct scanner
+    scanner_ = QGScanner(padded_dim_, degree_bound_);
+
+    q_prefetch_lines_ = (q_row_offset_ + 63) / 64;
+
     input.close();
 }
 
@@ -249,38 +403,58 @@ using MaxHeap = std::
     priority_queue<Candidate<float>, std::vector<Candidate<float>>, CandidateComparator>;
 
 /*
- * Search using PCA-rotated asymmetric CAQ distance estimation.
+ * Search using fastscan (RaBitQ) for fast filtering + CAQ for accurate re-scoring.
  *
- * Phase 0: Asymmetric [vmin, vmax] quantization with rescale estimator.
- * Phase 1: PCA rotation concentrates variance in leading dimensions.
+ * System A (fast): binary fastscan with RaBitQ factors → approximate distance
+ * System B (accurate): 8-bit CAQ codes → precise distance estimate
  *
- * All code data accessed from qdata_ (colocated CAQ codes + neighbor IDs).
- * Per-vector factors accessed from caq_factors_.
+ * Both systems operate in centered-rotated space (rotated - centroid).
  */
 inline void QuantizedGraph::search(
     const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
 ) {
     visited_.clear();
 
-    // Phase 1: PCA rotate query
+    // PCA rotate query
     std::vector<float> rotated_q(dimension_);
     pca_rotator_.rotate(query, rotated_q.data());
 
-    // Precompute per-query constants for CAQ distance
+    // Center query (subtract centroid)
+    std::vector<float> centered_q(dimension_);
     float q_l2sqr = 0;
     float sum_q = 0;
     for (size_t d = 0; d < dimension_; ++d) {
-        q_l2sqr += rotated_q[d] * rotated_q[d];
-        sum_q += rotated_q[d];
+        centered_q[d] = rotated_q[d] - centroid_[d];
+        q_l2sqr += centered_q[d] * centered_q[d];
+        sum_q += centered_q[d];
     }
 
-    MaxHeap search_pool, res_pool;
-    constexpr size_t PREFETCH_AHEAD = 4;
+    // Fastscan query quantization: pad to padded_dim_, quantize 6-bit, build LUT
+    std::vector<float, memory::AlignedAllocator<float>> padded_q(padded_dim_, 0.0f);
+    std::copy(centered_q.begin(), centered_q.end(), padded_q.data());
 
-    // Start from entry point
+    float lo, hi;
+    scalar::data_range(padded_q.data(), padded_dim_, lo, hi);
+    float width = (hi - lo) / ((1 << QG_BQUERY) - 1);
+    if (width < 1e-10f) width = 1e-10f;
+    float vl = lo;
+
+    std::vector<uint8_t, memory::AlignedAllocator<uint8_t, 64>> byte_query(padded_dim_);
+    int32_t sumq_int = 0;
+    scalar::quantize(byte_query.data(), padded_q.data(), padded_dim_, lo, width, sumq_int);
+
+    std::vector<uint8_t, memory::AlignedAllocator<uint8_t, 64>> lut(padded_dim_ * 4);
+    scanner_.pack_lut(byte_query.data(), lut.data());
+
+    // Approx dist buffer for one node's neighbors
+    std::vector<float> appro_dist(degree_bound_);
+
+    MaxHeap search_pool, res_pool;
+
+    // Start from entry point — use accurate CAQ distance
     PID cur_node = entry_point_;
     float sqr_y = caq_l2_estimate(
-        rotated_q.data(), get_qvector(cur_node), &caq_factors_[cur_node],
+        centered_q.data(), &vec_codes_[cur_node * dimension_], &caq_factors_[cur_node],
         q_l2sqr, sum_q, dimension_
     );
     float lowerBound = sqr_y;
@@ -296,40 +470,49 @@ inline void QuantizedGraph::search(
         }
         search_pool.pop();
 
+        // Fastscan: batch compute approximate distances for all neighbors
+        const uint8_t* packed_codes_ptr = get_qcodes(cur_node);
+        const float* factors_ptr = get_qfactors(cur_node);
         const PID* ptr_nb = get_qneighbors(cur_node);
 
-        // Prefetch initial batch
-        for (uint32_t j = 0; j < std::min(degree_bound_, PREFETCH_AHEAD); ++j) {
-            memory::mem_prefetch_l2(
-                reinterpret_cast<const char*>(get_qvector(ptr_nb[j])),
-                q_prefetch_lines_
-            );
-        }
+        scanner_.scan_neighbors(
+            appro_dist.data(), lut.data(),
+            q_l2sqr, vl, width, sumq_int,
+            packed_codes_ptr, factors_ptr
+        );
 
+        // Filter + accurate re-score
         for (uint32_t i = 0; i < degree_bound_; ++i) {
-            if (i + PREFETCH_AHEAD < degree_bound_) {
-                memory::mem_prefetch_l2(
-                    reinterpret_cast<const char*>(get_qvector(ptr_nb[i + PREFETCH_AHEAD])),
-                    q_prefetch_lines_
-                );
+            PID cur_neighbor = ptr_nb[i];
+            if (visited_.get(cur_neighbor)) {
+                continue;
+            }
+            visited_.set(cur_neighbor);
+
+            // Fastscan filter: skip if approx distance worse than current bound
+            if (res_pool.size() >= cur_ef_ && appro_dist[i] > lowerBound) {
+                continue;
             }
 
-            PID cur_neighbor = ptr_nb[i];
-            if (!visited_.get(cur_neighbor)) {
-                visited_.set(cur_neighbor);
-                sqr_y = caq_l2_estimate(
-                    rotated_q.data(), get_qvector(cur_neighbor),
-                    &caq_factors_[cur_neighbor],
-                    q_l2sqr, sum_q, dimension_
-                );
-                if (res_pool.size() < cur_ef_ || lowerBound > sqr_y) {
-                    search_pool.emplace(cur_neighbor, -sqr_y);
-                    res_pool.emplace(cur_neighbor, sqr_y);
-                    if (res_pool.size() > cur_ef_) {
-                        res_pool.pop();
-                    }
-                    lowerBound = res_pool.top().distance;
+            // Accurate re-score with CAQ
+            // Prefetch the CAQ codes for this neighbor
+            memory::mem_prefetch_l1(
+                reinterpret_cast<const char*>(&vec_codes_[cur_neighbor * dimension_]),
+                (dimension_ + 63) / 64
+            );
+            sqr_y = caq_l2_estimate(
+                centered_q.data(), &vec_codes_[cur_neighbor * dimension_],
+                &caq_factors_[cur_neighbor],
+                q_l2sqr, sum_q, dimension_
+            );
+
+            if (res_pool.size() < cur_ef_ || lowerBound > sqr_y) {
+                search_pool.emplace(cur_neighbor, -sqr_y);
+                res_pool.emplace(cur_neighbor, sqr_y);
+                if (res_pool.size() > cur_ef_) {
+                    res_pool.pop();
                 }
+                lowerBound = res_pool.top().distance;
             }
         }
     }
@@ -344,6 +527,7 @@ inline void QuantizedGraph::search(
 }
 
 inline void QuantizedGraph::initialize() {
+    // Build-time layout (unchanged)
     this->neighbor_offset_ = dimension_;
     this->row_offset_ = neighbor_offset_ + degree_bound_;
     data_ = data::
@@ -351,10 +535,21 @@ inline void QuantizedGraph::initialize() {
             std::vector<size_t>{num_points_, row_offset_}
         );
 
-    // Query-time layout: caq_code + neighbor_IDs (colocated)
-    this->q_neighbor_offset_ = dimension_;
-    this->q_row_offset_ = dimension_ + degree_bound_ * sizeof(PID);
-    this->q_prefetch_lines_ = (q_row_offset_ + 63) / 64;
+    // Padded dim: round up to multiple of 64 for binary packing
+    padded_dim_ = (dimension_ + 63) & ~63ULL;
+
+    // Fastscan packed codes: degree_bound_ vectors, each padded_dim_ bits
+    // pack_codes produces (degree_bound_/32) blocks, each block = padded_dim_ * 4 bytes
+    size_t num_blocks = (degree_bound_ + kBatchSize - 1) / kBatchSize;
+    fastscan_bytes_ = num_blocks * padded_dim_ * 4;
+
+    // Layout: [fastscan_codes | triple_x[deg] | fac_dq[deg] | fac_vq[deg] | neighbor_IDs[deg]]
+    q_factors_offset_ = fastscan_bytes_;
+    size_t factors_bytes = 3 * degree_bound_ * sizeof(float);
+    q_neighbor_offset_ = q_factors_offset_ + factors_bytes;
+    q_row_offset_ = q_neighbor_offset_ + degree_bound_ * sizeof(PID);
+    q_prefetch_lines_ = (q_row_offset_ + 63) / 64;
+
     qdata_ = data::Array<
         uint8_t,
         std::vector<size_t>,
@@ -363,6 +558,9 @@ inline void QuantizedGraph::initialize() {
     );
 
     caq_factors_.resize(num_points_);
+
+    // Init scanner
+    scanner_ = QGScanner(padded_dim_, degree_bound_);
 }
 
 inline void QuantizedGraph::find_candidates(
