@@ -61,6 +61,9 @@ class QuantizedGraph {
     // Per-vector packed binary codes [N][padded_dim/64 uint64s]
     std::vector<std::vector<uint64_t>> binary_packed_;
 
+    // Build-time: centered-rotated vectors for approximate graph search [N * dim floats]
+    std::vector<float> centered_vecs_;
+
     // Fastscan scanner
     QGScanner scanner_;
 
@@ -135,6 +138,10 @@ class QuantizedGraph {
         PID, size_t, std::vector<Candidate<float>>&,
         HashBasedBooleanSet&, const std::vector<uint32_t>&
     ) const;
+    void find_candidates_approx(
+        PID, size_t, std::vector<Candidate<float>>&,
+        HashBasedBooleanSet&, const std::vector<uint32_t>&
+    ) const;
     void update_qg(PID, const std::vector<Candidate<float>>&);
     void finalize_index();
 
@@ -201,16 +208,21 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
         centroid_[d] *= inv_n;
     }
 
+    // Center all rotated vectors in-place (subtract centroid)
+#pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_points_; ++i) {
+        for (size_t d = 0; d < dimension_; ++d) {
+            all_rotated[i * dimension_ + d] -= centroid_[d];
+        }
+    }
+    // all_rotated[i] is now the centered-rotated vector
+
     // System B (accurate): CAQ encode centered vectors
     vec_codes_.resize(num_points_ * dimension_);
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
-        std::vector<float> centered(dimension_);
-        for (size_t d = 0; d < dimension_; ++d) {
-            centered[d] = all_rotated[i * dimension_ + d] - centroid_[d];
-        }
         caq_encode_single(
-            centered.data(), dimension_,
+            &all_rotated[i * dimension_], dimension_,
             &vec_codes_[i * dimension_], &caq_factors_[i]
         );
     }
@@ -224,21 +236,24 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
 
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
-        std::vector<float> centered(padded_dim_, 0.0f);
+        std::vector<float> padded(padded_dim_, 0.0f);
         std::vector<int> binary(padded_dim_, 0);
+        std::memcpy(padded.data(), &all_rotated[i * dimension_], dimension_ * sizeof(float));
         for (size_t d = 0; d < dimension_; ++d) {
-            centered[d] = all_rotated[i * dimension_ + d] - centroid_[d];
-            binary[d] = (centered[d] > 0) ? 1 : 0;
+            binary[d] = (padded[d] > 0) ? 1 : 0;
         }
 
         rabitq_factors_single(
-            centered.data(), binary.data(), centroid_.data(), dimension_,
+            padded.data(), binary.data(), centroid_.data(), dimension_,
             &fast_triple_x_[i], &fast_fac_dq_[i], &fast_fac_vq_[i]
         );
 
         binary_packed_[i].resize(words_per_vec);
         space::pack_binary(binary.data(), binary_packed_[i].data(), padded_dim_);
     }
+
+    // Store centered vectors for build-time approximate graph search
+    centered_vecs_ = std::move(all_rotated);
 
     std::cout << "\tVectors Copied, PCA Rotated, Centered, CAQ + RaBitQ Encoded\n";
 }
@@ -277,7 +292,7 @@ inline void QuantizedGraph::finalize_index() {
         std::memcpy(dst_nb, src_nb, degree_bound_ * sizeof(PID));
     }
 
-    // Free build-time binary data (no longer needed)
+    // Free build-time data (no longer needed)
     binary_packed_.clear();
     binary_packed_.shrink_to_fit();
     fast_triple_x_.clear();
@@ -286,6 +301,8 @@ inline void QuantizedGraph::finalize_index() {
     fast_fac_dq_.shrink_to_fit();
     fast_fac_vq_.clear();
     fast_fac_vq_.shrink_to_fit();
+    centered_vecs_.clear();
+    centered_vecs_.shrink_to_fit();
 
     std::cout << "\tIndex finalized (fastscan packed + factors + neighbors colocated)\n";
 }
@@ -616,6 +633,72 @@ inline void QuantizedGraph::find_candidates(
                 continue;
             }
             tmp_pool.insert(cur_neighbor, dist);
+        }
+
+        if (cur_candi != cur_id) {
+            results.emplace_back(cur_candi, sqr_y);
+        }
+    }
+}
+
+/*
+ * Approximate graph search for build-time candidate finding.
+ * Uses CAQ distance for traversal decisions (fast uint8 dot products),
+ * but returns exact L2 distances for pruning consistency.
+ */
+inline void QuantizedGraph::find_candidates_approx(
+    PID cur_id,
+    size_t search_ef,
+    std::vector<Candidate<float>>& results,
+    HashBasedBooleanSet& vis,
+    const std::vector<uint32_t>& degrees
+) const {
+    const float* query_raw = get_vector(cur_id);
+    const float* query_centered = &centered_vecs_[cur_id * dimension_];
+
+    // Precompute query constants for CAQ distance
+    float q_l2sqr = 0;
+    float sum_q = 0;
+    for (size_t d = 0; d < dimension_; ++d) {
+        q_l2sqr += query_centered[d] * query_centered[d];
+        sum_q += query_centered[d];
+    }
+
+    buffer::SearchBuffer tmp_pool(search_ef);
+
+    // Entry: use CAQ distance for traversal
+    float entry_approx = caq_l2_estimate(
+        query_centered, &vec_codes_[entry_point_ * dimension_],
+        &caq_factors_[entry_point_], q_l2sqr, sum_q, dimension_
+    );
+    tmp_pool.insert(this->entry_point_, entry_approx);
+
+    while (tmp_pool.has_next()) {
+        auto cur_candi = tmp_pool.pop();
+        if (vis.get(cur_candi)) {
+            continue;
+        }
+        vis.set(cur_candi);
+
+        // Exact L2 for result quality (used by heuristic_prune)
+        float sqr_y = space::l2_sqr(query_raw, get_vector(cur_candi), dimension_);
+
+        const PID* ptr_nb = get_neighbors(cur_candi);
+        auto cur_degree = degrees[cur_candi];
+        for (uint32_t i = 0; i < cur_degree; ++i) {
+            PID cur_neighbor = ptr_nb[i];
+            if (vis.get(cur_neighbor)) {
+                continue;
+            }
+            // CAQ distance for traversal — ~4x cheaper than float L2
+            float approx_dist = caq_l2_estimate(
+                query_centered, &vec_codes_[cur_neighbor * dimension_],
+                &caq_factors_[cur_neighbor], q_l2sqr, sum_q, dimension_
+            );
+            if (tmp_pool.is_full(approx_dist)) {
+                continue;
+            }
+            tmp_pool.insert(cur_neighbor, approx_dist);
         }
 
         if (cur_candi != cur_id) {

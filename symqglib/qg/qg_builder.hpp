@@ -210,7 +210,7 @@ inline void QGBuilder::search_new_neighbors(bool refine) {
         HashBasedBooleanSet& vis = visited_list_[tid];
         candidates.reserve(2 * max_candidate_pool_size_);
         vis.clear();
-        qg_.find_candidates(cur_id, ef_build_, candidates, vis, degrees_);
+        qg_.find_candidates_approx(cur_id, ef_build_, candidates, vis, degrees_);
 
         // add current neighbors
         for (auto& nei : new_neighbors_[cur_id]) {
