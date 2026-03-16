@@ -36,6 +36,9 @@ class QuantizedGraph {
     size_t padded_dim_ = 0;
     PID entry_point_ = 0;
 
+    // Build-time flag: true = exact L2 for find_candidates, false = fascscan
+    bool use_exact_build_ = true;
+
     PCARotator pca_rotator_;
     QuantPlan quant_plan_;
 
@@ -338,35 +341,52 @@ inline void QuantizedGraph::find_candidates(
 ) const {
     const float* query = get_vector(cur_id);
 
-    buffer::SearchBuffer tmp_pool(search_ef);
-    float entry_dist = space::l2_sqr(query, get_vector(this->entry_point_), dimension_);
-    tmp_pool.insert(this->entry_point_, entry_dist);
+    if (use_exact_build_) {
+        // Exact L2 path (for first iteration when residuals are large)
+        buffer::SearchBuffer tmp_pool(search_ef);
+        tmp_pool.insert(this->entry_point_,
+            space::l2_sqr(query, get_vector(this->entry_point_), dimension_));
 
-    while (tmp_pool.has_next()) {
-        auto cur_candi = tmp_pool.pop();
-        if (vis.get(cur_candi)) {
-            continue;
-        }
-        vis.set(cur_candi);
-
-        float sqr_y = space::l2_sqr(query, get_vector(cur_candi), dimension_);
-
-        const PID* ptr_nb = get_neighbors(cur_candi);
-        auto cur_degree = degrees[cur_candi];
-        for (uint32_t i = 0; i < cur_degree; ++i) {
-            PID cur_neighbor = ptr_nb[i];
-            if (vis.get(cur_neighbor)) {
-                continue;
+        while (tmp_pool.has_next()) {
+            auto cur_candi = tmp_pool.pop();
+            if (vis.get(cur_candi)) continue;
+            vis.set(cur_candi);
+            float sqr_y = space::l2_sqr(query, get_vector(cur_candi), dimension_);
+            const PID* ptr_nb = get_neighbors(cur_candi);
+            auto cur_degree = degrees[cur_candi];
+            for (uint32_t i = 0; i < cur_degree; ++i) {
+                PID nb = ptr_nb[i];
+                if (vis.get(nb)) continue;
+                float dist = space::l2_sqr(query, get_vector(nb), dimension_);
+                if (tmp_pool.is_full(dist)) continue;
+                tmp_pool.insert(nb, dist);
             }
-            float dist = space::l2_sqr(query, get_vector(cur_neighbor), dimension_);
-            if (tmp_pool.is_full(dist)) {
-                continue;
-            }
-            tmp_pool.insert(cur_neighbor, dist);
+            if (cur_candi != cur_id)
+                results.emplace_back(cur_candi, sqr_y);
         }
+    } else {
+        // Fascscan path (for subsequent iterations when residuals are small)
+        QGQuery q_obj(padded_dim_);
+        q_obj.prepare(query, pca_rotator_, scanner_);
 
-        if (cur_candi != cur_id) {
-            results.emplace_back(cur_candi, sqr_y);
+        buffer::SearchBuffer tmp_pool(search_ef);
+        tmp_pool.insert(this->entry_point_, 1e10);
+        memory::mem_prefetch_l1(
+            reinterpret_cast<const char*>(get_vector(this->entry_point_)),
+            prefetch_lines_
+        );
+
+        std::vector<float> appro_dist(degree_bound_);
+        while (tmp_pool.has_next()) {
+            auto cur_candi = tmp_pool.pop();
+            if (vis.get(cur_candi)) continue;
+            vis.set(cur_candi);
+            auto cur_degree = degrees[cur_candi];
+            auto sqr_y = scan_neighbors(
+                q_obj, get_vector(cur_candi), appro_dist.data(), tmp_pool, cur_degree
+            );
+            if (cur_candi != cur_id)
+                results.emplace_back(cur_candi, sqr_y);
         }
     }
 }
