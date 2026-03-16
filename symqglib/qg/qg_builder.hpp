@@ -84,36 +84,13 @@ class QGBuilder {
             std::cerr << "The number of iter for building qg should >= 3\n";
             abort();
         }
-        // Iter 0: exact L2
-        iter(false);
-
-        // Diagnostic: test fascscan accuracy after iter 0
-        {
-            PID test_id = 42;
-            const float* q = qg_.get_vector(test_id);
-            QGQuery q_obj(qg_.padded_dim_);
-            q_obj.prepare(q, qg_.pca_rotator_, qg_.scanner_);
-            std::vector<float> ad(qg_.degree_bound_);
-            const float* node_data = qg_.get_vector(qg_.entry_point_);
-            float sqr_y = space::l2_sqr(q, node_data, qg_.dimension_);
-            qg_.scan_neighbors(q_obj, node_data, ad.data(),
-                *const_cast<buffer::SearchBuffer*>(&qg_.search_pool_), qg_.degree_bound_);
-            const PID* nbs = qg_.get_neighbors(qg_.entry_point_);
-            std::cout << "[DIAG iter1] query=" << test_id << " node=" << qg_.entry_point_
-                      << " sqr_y=" << sqr_y << "\n";
-            for (int j = 0; j < 5; j++) {
-                float exact = space::l2_sqr(q, qg_.get_vector(nbs[j]), qg_.dimension_);
-                std::cout << "  nb=" << nbs[j] << " approx=" << ad[j]
-                          << " exact=" << exact << " ratio=" << ad[j]/exact << "\n";
-            }
-        }
-
-        // Iter 1+: switch to fascscan
-        qg_.use_exact_build_ = false;
-        for (size_t i = 1; i < num_iter - 1; ++i) {
+        // Graph construction: FHT + RaBitQ fascscan (baseline-speed)
+        for (size_t i = 0; i < num_iter - 1; ++i) {
             iter(false);
         }
         iter(true);
+        // Post-build: encode all nodes with PCA + 4-bit SAQ
+        qg_.finalize_saq();
     }
 
     void check_dup() const {

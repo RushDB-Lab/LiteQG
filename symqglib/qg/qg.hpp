@@ -12,6 +12,7 @@
 #include "../common.hpp"
 #include "../quantization/caq.hpp"
 #include "../quantization/fastscan_impl.hpp"
+#include "../quantization/rabitq.hpp"
 #include "../quantization/saq_plan.hpp"
 #include "../space/l2.hpp"
 #include "../third/ngt/hashset.hpp"
@@ -20,6 +21,7 @@
 #include "../utils/io.hpp"
 #include "../utils/memory.hpp"
 #include "../utils/pca_rotator.hpp"
+#include "../utils/rotator.hpp"
 #include "../utils/scalar_quantize.hpp"
 #include "./qg_query.hpp"
 #include "./qg_scanner.hpp"
@@ -36,108 +38,112 @@ class QuantizedGraph {
     size_t padded_dim_ = 0;
     PID entry_point_ = 0;
 
-    // Build-time flag: true = exact L2 for find_candidates, false = fascscan
-    bool use_exact_build_ = true;
+    // Build phase: FHT + RaBitQ (baseline)
+    FHTRotator rotator_;
 
+    // Search phase: PCA + 4-bit SAQ
     PCARotator pca_rotator_;
     QuantPlan quant_plan_;
+    QGScanner scanner_;
+    HashBasedBooleanSet visited_;
+    buffer::SearchBuffer search_pool_;
+    QGQuery query_obj_;
+    std::vector<float> appro_dist_;
+    size_t prefetch_lines_ = 0;
 
+    // Single data array — layout depends on phase:
+    //   Build: [raw_vec(dim) | RaBitQ_codes | RaBitQ_factors(3) | neighbors(deg)]
+    //   After finalize: [raw_vec(dim) | SAQ_4bit_codes | SAQ_factors(4) | neighbors(deg)]
     data::Array<
         float,
         std::vector<size_t>,
         memory::AlignedAllocator<float, 1 << 22, true>>
         data_;
 
-    QGScanner scanner_;
-    HashBasedBooleanSet visited_;
-    buffer::SearchBuffer search_pool_;
-
-    // Pre-allocated search buffers (avoid per-query malloc)
-    QGQuery query_obj_;
-    std::vector<float> appro_dist_;
-
-    // Prefetch lines for one data row
-    size_t prefetch_lines_ = 0;
-
+    // Layout offsets (float units) — set for SAQ layout (superset of build layout)
     size_t code_offset_ = 0;
     size_t factor_offset_ = 0;
     size_t neighbor_offset_ = 0;
     size_t row_offset_ = 0;
 
+    // Build-phase offsets (RaBitQ layout, within the same row allocation)
+    size_t build_code_offset_ = 0;
+    size_t build_factor_offset_ = 0;
+    size_t build_neighbor_offset_ = 0;
+
+    bool build_phase_ = true;  // true during build, false after finalize_saq
+
     void initialize();
     void copy_vectors(const float*);
+    void finalize_saq();
+    void encode_saq_node(PID cur_id, size_t degree);
 
-    [[nodiscard]] float* get_vector(PID data_id) {
-        return &data_.at(row_offset_ * data_id);
+    [[nodiscard]] float* get_vector(PID id) { return &data_.at(row_offset_ * id); }
+    [[nodiscard]] const float* get_vector(PID id) const { return &data_.at(row_offset_ * id); }
+
+    // Build-phase accessors (RaBitQ layout)
+    [[nodiscard]] uint8_t* get_build_code(PID id) {
+        return reinterpret_cast<uint8_t*>(&data_.at(row_offset_ * id + build_code_offset_));
     }
-    [[nodiscard]] const float* get_vector(PID data_id) const {
-        return &data_.at(row_offset_ * data_id);
+    [[nodiscard]] float* get_build_factor(PID id) {
+        return &data_.at(row_offset_ * id + build_factor_offset_);
     }
-    [[nodiscard]] uint8_t* get_packed_code(PID data_id) {
-        return reinterpret_cast<uint8_t*>(
-            &data_.at((row_offset_ * data_id) + code_offset_)
-        );
+    [[nodiscard]] PID* get_build_neighbors(PID id) {
+        return reinterpret_cast<PID*>(&data_.at(row_offset_ * id + build_neighbor_offset_));
     }
-    [[nodiscard]] const uint8_t* get_packed_code(PID data_id) const {
-        return reinterpret_cast<const uint8_t*>(
-            &data_.at((row_offset_ * data_id) + code_offset_)
-        );
-    }
-    [[nodiscard]] float* get_factor(PID data_id) {
-        return &data_.at((row_offset_ * data_id) + factor_offset_);
-    }
-    [[nodiscard]] const float* get_factor(PID data_id) const {
-        return &data_.at((row_offset_ * data_id) + factor_offset_);
-    }
-    [[nodiscard]] PID* get_neighbors(PID data_id) {
-        return reinterpret_cast<PID*>(
-            &data_.at((row_offset_ * data_id) + neighbor_offset_)
-        );
-    }
-    [[nodiscard]] const PID* get_neighbors(PID data_id) const {
-        return reinterpret_cast<const PID*>(
-            &data_.at((row_offset_ * data_id) + neighbor_offset_)
-        );
+    [[nodiscard]] const PID* get_build_neighbors(PID id) const {
+        return reinterpret_cast<const PID*>(&data_.at(row_offset_ * id + build_neighbor_offset_));
     }
 
-    void find_candidates(
-        PID, size_t, std::vector<Candidate<float>>&,
-        HashBasedBooleanSet&, const std::vector<uint32_t>&
-    ) const;
+    // Search-phase accessors (SAQ layout)
+    [[nodiscard]] uint8_t* get_saq_code(PID id) {
+        return reinterpret_cast<uint8_t*>(&data_.at(row_offset_ * id + code_offset_));
+    }
+    [[nodiscard]] const uint8_t* get_saq_code(PID id) const {
+        return reinterpret_cast<const uint8_t*>(&data_.at(row_offset_ * id + code_offset_));
+    }
+    [[nodiscard]] float* get_saq_factor(PID id) {
+        return &data_.at(row_offset_ * id + factor_offset_);
+    }
+    [[nodiscard]] const float* get_saq_factor(PID id) const {
+        return &data_.at(row_offset_ * id + factor_offset_);
+    }
+    [[nodiscard]] PID* get_neighbors(PID id) {
+        return reinterpret_cast<PID*>(&data_.at(row_offset_ * id + neighbor_offset_));
+    }
+    [[nodiscard]] const PID* get_neighbors(PID id) const {
+        return reinterpret_cast<const PID*>(&data_.at(row_offset_ * id + neighbor_offset_));
+    }
 
+    // Build: exact L2 candidate search + RaBitQ codes for baseline compatibility
+    void find_candidates(PID, size_t, std::vector<Candidate<float>>&, HashBasedBooleanSet&, const std::vector<uint32_t>&) const;
     void update_qg(PID, const std::vector<Candidate<float>>&);
-    void update_results(buffer::ResultBuffer&, const float*);
 
-    float scan_neighbors(
-        const QGQuery& q_obj,
-        const float* cur_data,
-        float* appro_dist,
-        buffer::SearchBuffer& search_pool,
-        uint32_t cur_degree
-    ) const;
+    // Search: SAQ fascscan
+    void update_results(buffer::ResultBuffer&, const float*);
+    float scan_neighbors(const QGQuery&, const float*, float*, buffer::SearchBuffer&, uint32_t) const;
 
    public:
     explicit QuantizedGraph(size_t, size_t, size_t);
 
-    [[nodiscard]] auto num_vertices() const { return this->num_points_; }
-    [[nodiscard]] auto dimension() const { return this->dimension_; }
-    [[nodiscard]] auto degree_bound() const { return this->degree_bound_; }
-    [[nodiscard]] auto entry_point() const { return this->entry_point_; }
-    void set_ep(PID entry) { this->entry_point_ = entry; };
+    [[nodiscard]] auto num_vertices() const { return num_points_; }
+    [[nodiscard]] auto dimension() const { return dimension_; }
+    [[nodiscard]] auto degree_bound() const { return degree_bound_; }
+    [[nodiscard]] auto entry_point() const { return entry_point_; }
+    void set_ep(PID entry) { entry_point_ = entry; }
 
     void save_index(const char*) const;
     void load_index(const char*);
     void set_ef(size_t);
-    void search(
-        const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
-    );
+    void search(const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results);
 };
 
 inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t dim)
     : num_points_(num)
     , degree_bound_(max_deg)
     , dimension_(dim)
-    , padded_dim_((dim + 63) & ~63ULL)
+    , padded_dim_(1 << ceil_log2(dim))  // power of 2 for FHT compatibility
+    , rotator_(dim)
     , pca_rotator_(dim)
     , scanner_(padded_dim_, degree_bound_)
     , visited_(100)
@@ -149,19 +155,25 @@ inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t dim)
 
 inline void QuantizedGraph::initialize() {
     assert(padded_dim_ % 64 == 0);
-    assert(padded_dim_ >= dimension_);
 
-    size_t fascscan_dim = padded_dim_ * 4;
-    size_t num_blocks = (degree_bound_ + kBatchSize - 1) / kBatchSize;
-    size_t fascscan_bytes = num_blocks * fascscan_dim * 4;
+    // SAQ layout (the one actually allocated — large enough for both phases)
+    size_t saq_fascscan_dim = padded_dim_ * 4;
+    size_t saq_code_floats = (degree_bound_ + kBatchSize - 1) / kBatchSize * saq_fascscan_dim * 4 / sizeof(float);
 
     code_offset_ = dimension_;
-    size_t code_size_floats = fascscan_bytes / sizeof(float);
-    factor_offset_ = code_offset_ + code_size_floats;
+    factor_offset_ = code_offset_ + saq_code_floats;
     neighbor_offset_ = factor_offset_ + 4 * degree_bound_;
     row_offset_ = neighbor_offset_ + degree_bound_;
 
-    // row_offset_ floats * 4 bytes, 64 bytes per cache line
+    // RaBitQ build layout (fits within the same row — offsets relative to row start)
+    // RaBitQ codes are smaller: padded_dim/64 * 2 * degree = 128 floats for SIFT
+    size_t rabitq_code_floats = padded_dim_ / 64 * 2 * degree_bound_;
+    build_code_offset_ = dimension_;
+    build_factor_offset_ = build_code_offset_ + rabitq_code_floats;
+    build_neighbor_offset_ = build_factor_offset_ + 3 * degree_bound_;
+    // Verify RaBitQ layout fits within SAQ row
+    assert(build_neighbor_offset_ + degree_bound_ <= row_offset_);
+
     prefetch_lines_ = (row_offset_ * sizeof(float) + 63) / 64;
 
     data_ = data::
@@ -173,68 +185,171 @@ inline void QuantizedGraph::initialize() {
 inline void QuantizedGraph::copy_vectors(const float* data) {
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_points_; ++i) {
-        const float* src = data + (dimension_ * i);
-        float* dst = get_vector(i);
-        std::copy(src, src + dimension_, dst);
+        std::copy(data + dimension_ * i, data + dimension_ * (i + 1), get_vector(i));
     }
 
+    // PCA fit (used later in finalize_saq)
     pca_rotator_.fit(data, num_points_, dimension_);
-
     constexpr float kAvgBits = 4.0f;
     quant_plan_ = segment_dp(pca_rotator_.eigenvalues().data(), dimension_, kAvgBits);
 
     std::cout << "\tVectors Copied, PCA Fitted\n";
 }
 
+// Build-time update: RaBitQ codes + factors (baseline-compatible)
 inline void QuantizedGraph::update_qg(
     PID cur_id, const std::vector<Candidate<float>>& new_neighbors
 ) {
     size_t cur_degree = new_neighbors.size();
-    if (cur_degree == 0) {
-        return;
-    }
+    if (cur_degree == 0) return;
 
-    PID* neighbor_ptr = get_neighbors(cur_id);
+    // Write neighbor IDs to BUILD position
+    PID* nb_ptr = get_build_neighbors(cur_id);
+    for (size_t i = 0; i < cur_degree; ++i)
+        nb_ptr[i] = new_neighbors[i].id;
+
+    // RaBitQ encoding (FHT rotation + 1-bit binarization)
+    RowMatrix<float> x_pad(cur_degree, padded_dim_);
+    RowMatrix<float> c_pad(1, padded_dim_);
+    x_pad.setZero();
+    c_pad.setZero();
+
     for (size_t i = 0; i < cur_degree; ++i) {
-        neighbor_ptr[i] = new_neighbors[i].id;
+        const auto* vec = get_vector(new_neighbors[i].id);
+        std::copy(vec, vec + dimension_, &x_pad(static_cast<long>(i), 0));
+    }
+    std::copy(get_vector(cur_id), get_vector(cur_id) + dimension_, &c_pad(0, 0));
+
+    RowMatrix<float> x_rot(cur_degree, padded_dim_);
+    RowMatrix<float> c_rot(1, padded_dim_);
+    for (long i = 0; i < static_cast<long>(cur_degree); ++i)
+        rotator_.rotate(&x_pad(i, 0), &x_rot(i, 0));
+    rotator_.rotate(&c_pad(0, 0), &c_rot(0, 0));
+
+    float* fac = get_build_factor(cur_id);
+    rabitq_codes(x_rot, c_rot, get_build_code(cur_id), fac, fac + degree_bound_, fac + 2 * degree_bound_);
+}
+
+// Build-time find_candidates: use RaBitQ fascscan (baseline-compatible)
+inline void QuantizedGraph::find_candidates(
+    PID cur_id, size_t search_ef, std::vector<Candidate<float>>& results,
+    HashBasedBooleanSet& vis, const std::vector<uint32_t>& degrees
+) const {
+    const float* query = get_vector(cur_id);
+
+    // Use FHT+RaBitQ fascscan for build (identical to baseline)
+    // Create query object with FHT rotation + 6-bit quantization
+    std::vector<float, memory::AlignedAllocator<float>> rd_query(padded_dim_);
+    rotator_.rotate(query, rd_query.data());
+
+    float lo, hi;
+    scalar::data_range(rd_query.data(), padded_dim_, lo, hi);
+    float width = (hi - lo) / ((1 << QG_BQUERY) - 1);
+    if (width < 1e-10f) width = 1e-10f;
+    std::vector<uint8_t, memory::AlignedAllocator<uint8_t, 64>> byte_q(padded_dim_);
+    int32_t sumq = 0;
+    scalar::quantize(byte_q.data(), rd_query.data(), padded_dim_, lo, width, sumq);
+
+    std::vector<uint8_t, memory::AlignedAllocator<uint8_t, 64>> lut(padded_dim_ * 4);
+    pack_lut_impl(padded_dim_, byte_q.data(), lut.data());
+
+    buffer::SearchBuffer tmp_pool(search_ef);
+    tmp_pool.insert(this->entry_point_, 1e10);
+
+    std::vector<uint16_t> fs_result(degree_bound_);
+    std::vector<float> fs_float(degree_bound_);
+    std::vector<float> appro_dist(degree_bound_);
+
+    while (tmp_pool.has_next()) {
+        auto cur_candi = tmp_pool.pop();
+        if (vis.get(cur_candi)) continue;
+        vis.set(cur_candi);
+
+        const float* cur_data = get_vector(cur_candi);
+        float sqr_y = space::l2_sqr(query, cur_data, dimension_);
+
+        // RaBitQ fascscan on build layout
+        const auto* packed_code = reinterpret_cast<const uint8_t*>(&cur_data[build_code_offset_]);
+        accumulate_impl(padded_dim_, packed_code, lut.data(), fs_result.data());
+
+        // Convert: 2*result - sumq (binary → signed)
+        for (size_t i = 0; i < degree_bound_; ++i)
+            fs_float[i] = static_cast<float>((static_cast<int>(fs_result[i]) << 1) - sumq);
+
+        // RaBitQ distance formula
+        const float* fac = &cur_data[build_factor_offset_];
+        const float* triple_x = fac;
+        const float* fac_dq = &triple_x[degree_bound_];
+        const float* fac_vq = &fac_dq[degree_bound_];
+        for (size_t i = 0; i < degree_bound_; ++i) {
+            appro_dist[i] = sqr_y + triple_x[i] + fac_dq[i] * width * fs_float[i] + fac_vq[i] * lo;
+        }
+
+        // Insert neighbors into pool
+        auto cur_degree = degrees[cur_candi];
+        const PID* ptr_nb = reinterpret_cast<const PID*>(&cur_data[build_neighbor_offset_]);
+        for (uint32_t i = 0; i < cur_degree; ++i) {
+            PID nb = ptr_nb[i];
+            if (tmp_pool.is_full(appro_dist[i]) || vis.get(nb)) continue;
+            tmp_pool.insert(nb, appro_dist[i]);
+        }
+
+        if (cur_candi != cur_id)
+            results.emplace_back(cur_candi, sqr_y);
+    }
+}
+
+// Post-build: encode all nodes with PCA + 4-bit SAQ
+inline void QuantizedGraph::finalize_saq() {
+    std::cout << "\tEncoding SAQ (PCA + 4-bit)...\n";
+
+#pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_points_; ++i) {
+        // Copy neighbor IDs from build position to SAQ position
+        const PID* build_nb = get_build_neighbors(i);
+        PID* saq_nb = get_neighbors(i);
+        std::memcpy(saq_nb, build_nb, degree_bound_ * sizeof(PID));
+
+        encode_saq_node(i, degree_bound_);
     }
 
+    build_phase_ = false;
+    std::cout << "\tSAQ encoding complete\n";
+}
+
+inline void QuantizedGraph::encode_saq_node(PID cur_id, size_t degree) {
     std::vector<float> centroid_rot(padded_dim_, 0.0f);
     pca_rotator_.rotate(get_vector(cur_id), centroid_rot.data());
 
     std::vector<float> nb_rot(padded_dim_, 0.0f);
     std::vector<float> residual(padded_dim_, 0.0f);
     std::vector<uint8_t> codes_4bit(padded_dim_);
-    std::vector<uint8_t> all_codes(cur_degree * padded_dim_, 0);
+    std::vector<uint8_t> all_codes(degree * padded_dim_, 0);
 
-    float* fac_ptr = get_factor(cur_id);
-    float* fac_a = fac_ptr;
+    float* fac = get_saq_factor(cur_id);
+    float* fac_a = fac;
     float* fac_b = fac_a + degree_bound_;
     float* fac_c = fac_b + degree_bound_;
     float* fac_d = fac_c + degree_bound_;
 
-    for (size_t i = 0; i < cur_degree; ++i) {
-        PID nb_id = new_neighbors[i].id;
+    const PID* nbs = get_neighbors(cur_id);
 
+    for (size_t i = 0; i < degree; ++i) {
         std::fill(nb_rot.begin(), nb_rot.end(), 0.0f);
-        pca_rotator_.rotate(get_vector(nb_id), nb_rot.data());
+        pca_rotator_.rotate(get_vector(nbs[i]), nb_rot.data());
 
-        for (size_t d = 0; d < padded_dim_; ++d) {
+        for (size_t d = 0; d < padded_dim_; ++d)
             residual[d] = nb_rot[d] - centroid_rot[d];
-        }
 
         float o_l2sqr, delta, vmin, rescale, sum_code;
-        caq_encode_4bit(
-            residual.data(), padded_dim_, codes_4bit.data(),
-            &o_l2sqr, &delta, &vmin, &rescale, &sum_code, 6
-        );
+        caq_encode_4bit(residual.data(), padded_dim_, codes_4bit.data(),
+            &o_l2sqr, &delta, &vmin, &rescale, &sum_code, 6);
 
         std::memcpy(&all_codes[i * padded_dim_], codes_4bit.data(), padded_dim_);
 
         float ip_c_r = 0;
-        for (size_t d = 0; d < padded_dim_; ++d) {
+        for (size_t d = 0; d < padded_dim_; ++d)
             ip_c_r += centroid_rot[d] * residual[d];
-        }
 
         fac_a[i] = o_l2sqr + 2.0f * ip_c_r;
         fac_b[i] = -2.0f * rescale * delta;
@@ -242,203 +357,108 @@ inline void QuantizedGraph::update_qg(
         fac_d[i] = -2.0f * rescale * (0.5f * delta + vmin);
     }
 
-    pack_codes_4bit(padded_dim_, all_codes.data(), cur_degree, get_packed_code(cur_id));
+    pack_codes_4bit(padded_dim_, all_codes.data(), degree, get_saq_code(cur_id));
 }
 
+// Search: SAQ 4-bit fascscan
 inline float QuantizedGraph::scan_neighbors(
-    const QGQuery& q_obj,
-    const float* cur_data,
-    float* appro_dist,
-    buffer::SearchBuffer& search_pool,
-    uint32_t cur_degree
+    const QGQuery& q_obj, const float* cur_data,
+    float* appro_dist, buffer::SearchBuffer& pool, uint32_t cur_degree
 ) const {
     float sqr_y = space::l2_sqr(q_obj.query_data(), cur_data, dimension_);
 
-    const auto* packed_code = reinterpret_cast<const uint8_t*>(&cur_data[code_offset_]);
+    const auto* code = reinterpret_cast<const uint8_t*>(&cur_data[code_offset_]);
     const auto* factor = &cur_data[factor_offset_];
-    this->scanner_.scan_neighbors(
+    scanner_.scan_neighbors(
         appro_dist, q_obj.lut(), sqr_y,
         q_obj.width(), q_obj.vl_half(), q_obj.sum_q_float(),
-        packed_code, factor
+        code, factor
     );
 
     const PID* ptr_nb = reinterpret_cast<const PID*>(&cur_data[neighbor_offset_]);
     for (uint32_t i = 0; i < cur_degree; ++i) {
-        PID cur_neighbor = ptr_nb[i];
-        float tmp_dist = appro_dist[i];
-        if (search_pool.is_full(tmp_dist) || visited_.get(cur_neighbor)) {
-            continue;
-        }
-        search_pool.insert(cur_neighbor, tmp_dist);
+        PID nb = ptr_nb[i];
+        float dist = appro_dist[i];
+        if (pool.is_full(dist) || visited_.get(nb)) continue;
+        pool.insert(nb, dist);
         memory::mem_prefetch_l2(
-            reinterpret_cast<const char*>(get_vector(search_pool.next_id())),
-            prefetch_lines_
+            reinterpret_cast<const char*>(get_vector(pool.next_id())), prefetch_lines_
         );
     }
-
     return sqr_y;
 }
 
-inline void QuantizedGraph::update_results(
-    buffer::ResultBuffer& result_pool, const float* query
-) {
-    if (result_pool.is_full()) {
-        return;
-    }
-    auto ids = result_pool.ids();
-    for (PID data_id : ids) {
-        PID* ptr_nb = get_neighbors(data_id);
-        for (uint32_t i = 0; i < this->degree_bound_; ++i) {
-            PID cur_neighbor = ptr_nb[i];
-            if (!visited_.get(cur_neighbor)) {
-                visited_.set(cur_neighbor);
-                result_pool.insert(
-                    cur_neighbor, space::l2_sqr(query, get_vector(cur_neighbor), dimension_)
-                );
+inline void QuantizedGraph::update_results(buffer::ResultBuffer& res, const float* query) {
+    if (res.is_full()) return;
+    auto ids = res.ids();
+    for (PID id : ids) {
+        PID* nbs = get_neighbors(id);
+        for (uint32_t i = 0; i < degree_bound_; ++i) {
+            PID nb = nbs[i];
+            if (!visited_.get(nb)) {
+                visited_.set(nb);
+                res.insert(nb, space::l2_sqr(query, get_vector(nb), dimension_));
             }
         }
-        if (result_pool.is_full()) {
-            break;
-        }
+        if (res.is_full()) break;
     }
 }
 
 inline void QuantizedGraph::search(
     const float* __restrict__ query, uint32_t knn, uint32_t* __restrict__ results
 ) {
-    this->visited_.clear();
-    this->search_pool_.clear();
-
+    visited_.clear();
+    search_pool_.clear();
     query_obj_.prepare(query, pca_rotator_, scanner_);
-
-    search_pool_.insert(this->entry_point_, FLT_MAX);
+    search_pool_.insert(entry_point_, FLT_MAX);
     buffer::ResultBuffer res_pool(knn);
-
     while (search_pool_.has_next()) {
-        PID cur_node = search_pool_.pop();
-        if (visited_.get(cur_node)) {
-            continue;
-        }
-        visited_.set(cur_node);
-
+        PID cur = search_pool_.pop();
+        if (visited_.get(cur)) continue;
+        visited_.set(cur);
         float sqr_y = scan_neighbors(
-            query_obj_, get_vector(cur_node),
-            appro_dist_.data(), this->search_pool_, this->degree_bound_
+            query_obj_, get_vector(cur), appro_dist_.data(), search_pool_, degree_bound_
         );
-        res_pool.insert(cur_node, sqr_y);
+        res_pool.insert(cur, sqr_y);
     }
-
     update_results(res_pool, query);
     res_pool.copy_results(results);
 }
 
-inline void QuantizedGraph::find_candidates(
-    PID cur_id,
-    size_t search_ef,
-    std::vector<Candidate<float>>& results,
-    HashBasedBooleanSet& vis,
-    const std::vector<uint32_t>& degrees
-) const {
-    const float* query = get_vector(cur_id);
-
-    if (use_exact_build_) {
-        // Exact L2 path (for first iteration when residuals are large)
-        buffer::SearchBuffer tmp_pool(search_ef);
-        tmp_pool.insert(this->entry_point_,
-            space::l2_sqr(query, get_vector(this->entry_point_), dimension_));
-
-        while (tmp_pool.has_next()) {
-            auto cur_candi = tmp_pool.pop();
-            if (vis.get(cur_candi)) continue;
-            vis.set(cur_candi);
-            float sqr_y = space::l2_sqr(query, get_vector(cur_candi), dimension_);
-            const PID* ptr_nb = get_neighbors(cur_candi);
-            auto cur_degree = degrees[cur_candi];
-            for (uint32_t i = 0; i < cur_degree; ++i) {
-                PID nb = ptr_nb[i];
-                if (vis.get(nb)) continue;
-                float dist = space::l2_sqr(query, get_vector(nb), dimension_);
-                if (tmp_pool.is_full(dist)) continue;
-                tmp_pool.insert(nb, dist);
-            }
-            if (cur_candi != cur_id)
-                results.emplace_back(cur_candi, sqr_y);
-        }
-    } else {
-        // Fascscan path (for subsequent iterations when residuals are small)
-        QGQuery q_obj(padded_dim_);
-        q_obj.prepare(query, pca_rotator_, scanner_);
-
-        buffer::SearchBuffer tmp_pool(search_ef);
-        tmp_pool.insert(this->entry_point_, 1e10);
-        memory::mem_prefetch_l1(
-            reinterpret_cast<const char*>(get_vector(this->entry_point_)),
-            prefetch_lines_
-        );
-
-        std::vector<float> appro_dist(degree_bound_);
-        while (tmp_pool.has_next()) {
-            auto cur_candi = tmp_pool.pop();
-            if (vis.get(cur_candi)) continue;
-            vis.set(cur_candi);
-            auto cur_degree = degrees[cur_candi];
-            auto sqr_y = scan_neighbors(
-                q_obj, get_vector(cur_candi), appro_dist.data(), tmp_pool, cur_degree
-            );
-            if (cur_candi != cur_id)
-                results.emplace_back(cur_candi, sqr_y);
-        }
-    }
-}
-
 inline void QuantizedGraph::set_ef(size_t cur_ef) {
-    this->search_pool_.resize(cur_ef);
-    this->visited_ = HashBasedBooleanSet(std::min(this->num_points_ / 10, cur_ef * cur_ef));
+    search_pool_.resize(cur_ef);
+    visited_ = HashBasedBooleanSet(std::min(num_points_ / 10, cur_ef * cur_ef));
 }
 
 inline void QuantizedGraph::save_index(const char* filename) const {
-    std::cout << "Saving quantized graph to " << filename << '\n';
-    std::ofstream output(filename, std::ios::binary);
-    assert(output.is_open());
-
-    output.write(reinterpret_cast<const char*>(&entry_point_), sizeof(PID));
-    pca_rotator_.save(output);
-
-    size_t plan_size = quant_plan_.size();
-    output.write(reinterpret_cast<const char*>(&plan_size), sizeof(size_t));
-    for (auto& seg : quant_plan_) {
-        output.write(reinterpret_cast<const char*>(&seg), sizeof(QuantSegment));
-    }
-
-    data_.save(output);
-    output.close();
-    std::cout << "\tQuantized graph saved!\n";
+    std::ofstream out(filename, std::ios::binary);
+    assert(out.is_open());
+    out.write(reinterpret_cast<const char*>(&entry_point_), sizeof(PID));
+    pca_rotator_.save(out);
+    size_t ps = quant_plan_.size();
+    out.write(reinterpret_cast<const char*>(&ps), sizeof(size_t));
+    for (auto& s : quant_plan_)
+        out.write(reinterpret_cast<const char*>(&s), sizeof(QuantSegment));
+    data_.save(out);
+    out.close();
+    std::cout << "Quantized graph saved to " << filename << "\n";
 }
 
 inline void QuantizedGraph::load_index(const char* filename) {
-    std::cout << "Loading quantized graph " << filename << '\n';
-
-    if (!file_exists(filename)) {
-        std::cerr << "Index does not exist!\n";
-        abort();
-    }
-
-    std::ifstream input(filename, std::ios::binary);
-    assert(input.is_open());
-
-    input.read(reinterpret_cast<char*>(&entry_point_), sizeof(PID));
-    pca_rotator_.load(input);
-
-    size_t plan_size = 0;
-    input.read(reinterpret_cast<char*>(&plan_size), sizeof(size_t));
-    quant_plan_.resize(plan_size);
-    for (auto& seg : quant_plan_) {
-        input.read(reinterpret_cast<char*>(&seg), sizeof(QuantSegment));
-    }
-
-    data_.load(input);
-    input.close();
-    std::cout << "Quantized graph loaded!\n";
+    if (!file_exists(filename)) { std::cerr << "Index not found!\n"; abort(); }
+    std::ifstream in(filename, std::ios::binary);
+    assert(in.is_open());
+    in.read(reinterpret_cast<char*>(&entry_point_), sizeof(PID));
+    pca_rotator_.load(in);
+    size_t ps = 0;
+    in.read(reinterpret_cast<char*>(&ps), sizeof(size_t));
+    quant_plan_.resize(ps);
+    for (auto& s : quant_plan_)
+        in.read(reinterpret_cast<char*>(&s), sizeof(QuantSegment));
+    data_.load(in);
+    in.close();
+    build_phase_ = false;
+    std::cout << "Quantized graph loaded\n";
 }
 
 }  // namespace symqg
