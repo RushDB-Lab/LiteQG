@@ -1,36 +1,17 @@
-#include <pybind11/functional.h>
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/string.h>
 
 #include <climits>
 #include <cstdint>
 #include <iostream>
 #include <memory>
-#include <string>
 
 #include "qg/qg.hpp"
 #include "qg/qg_builder.hpp"
 
-namespace py = pybind11;
-using py_float_array = py::array_t<float, py::array::c_style | py::array::forcecast>;
-using py_uint_array = py::array_t<uint32_t, py::array::c_style | py::array::forcecast>;
-
-namespace {
-void get_arr_shape(const py::buffer_info& buffer, size_t& rows, size_t& cols) {
-    if (buffer.ndim != 2 && buffer.ndim != 1) {
-        std::cerr << "Input data has an incorrect shape. Data must be a 1D or 2D array.\n";
-        return;
-    }
-    if (buffer.ndim == 2) {
-        rows = buffer.shape[0];
-        cols = buffer.shape[1];
-    } else {
-        rows = 1;
-        cols = buffer.shape[0];
-    }
-}
-}  // namespace
+namespace nb = nanobind;
+using namespace nb::literals;
 
 struct Index {
     std::unique_ptr<symqg::QuantizedGraph> index = nullptr;
@@ -67,16 +48,17 @@ struct Index {
     void set_ef(size_t ef_search) const { index->set_ef(ef_search); }
 
     void build_index(
-        const py::object& data,
+        nb::ndarray<float, nb::c_contig, nb::device::cpu> items,
         size_t ef_indexing,
         size_t num_iter = 3,
         size_t num_threads = UINT_MAX
     ) const {
-        py::array_t<float, py::array::c_style | py::array::forcecast> items(data);
-        auto buffer = items.request();
-        size_t num = 0;
-        size_t dim = 0;
-        get_arr_shape(buffer, num, dim);
+        size_t num = items.shape(0);
+        size_t dim = (items.ndim() == 2) ? items.shape(1) : items.shape(0);
+        if (items.ndim() == 1) {
+            num = 1;
+        }
+
         if (num != index->num_vertices() || dim != index->dimension()) {
             std::cerr
                 << "The shape of data is different with initialization! Expected shape: ("
@@ -89,37 +71,41 @@ struct Index {
         std::cout << "\tQuantizedGraph created\n";
     }
 
-    auto search(py_float_array& query, uint32_t knn) const {
-        py_uint_array result(knn);
-        auto* result_ptr = static_cast<uint32_t*>(result.request().ptr);
-        index->search(query.data(0), knn, result_ptr);
+    nb::ndarray<nb::numpy, uint32_t> search(
+        nb::ndarray<float, nb::c_contig, nb::device::cpu> query,
+        uint32_t knn
+    ) const {
+        auto* result = new uint32_t[knn];
+        index->search(query.data(), knn, result);
 
-        return result;
+        size_t shape[1] = {knn};
+        nb::capsule owner(result, [](void* p) noexcept { delete[] static_cast<uint32_t*>(p); });
+        return nb::ndarray<nb::numpy, uint32_t>(result, 1, shape, std::move(owner));
     }
 };
 
-PYBIND11_MODULE(symphonyqg, m) {
-    m.doc() = R"pbdoc(Towards Symphonious Integration of Graph and Quantization)pbdoc";
+NB_MODULE(symphonyqg, m) {
+    m.doc() = "Towards Symphonious Integration of Graph and Quantization";
 
-    py::class_<Index>(m, "Index")
+    nb::class_<Index>(m, "Index")
         .def(
-            py::init<const std::string&, const std::string&, size_t, size_t, size_t>(),
-            py::arg("index_type"),
-            py::arg("metric"),
-            py::arg("num_elements"),
-            py::arg("dimension"),
-            py::arg("degree_bound") = 32
+            nb::init<const std::string&, const std::string&, size_t, size_t, size_t>(),
+            "index_type"_a,
+            "metric"_a,
+            "num_elements"_a,
+            "dimension"_a,
+            "degree_bound"_a = 32
         )
-        .def("load", &Index::load, py::arg("filename"))
-        .def("save", &Index::save, py::arg("filename"))
-        .def("set_ef", &Index::set_ef, py::arg("EF"))
+        .def("load", &Index::load, "filename"_a)
+        .def("save", &Index::save, "filename"_a)
+        .def("set_ef", &Index::set_ef, "EF"_a)
         .def(
             "build_index",
             &Index::build_index,
-            py::arg("data"),
-            py::arg("EF"),
-            py::arg("num_iter") = 3,
-            py::arg("num_thread") = UINT_MAX
+            "data"_a,
+            "EF"_a,
+            "num_iter"_a = 3,
+            "num_thread"_a = UINT_MAX
         )
-        .def("search", &Index::search, py::arg("query"), py::arg("k"));
+        .def("search", &Index::search, "query"_a, "k"_a);
 }
