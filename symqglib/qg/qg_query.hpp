@@ -15,7 +15,8 @@ constexpr int kSaqQueryBits = 4;
 class QGQuery {
    private:
     const float* query_data_ = nullptr;
-    size_t padded_dim_ = 0;
+    size_t padded_dim_ = 0;  // full PCA rotation output size
+    size_t saq_dim_ = 0;     // how many top PCA dims to quantize
     float width_ = 0;
     float vl_half_ = 0;
     float sum_q_float_ = 0;
@@ -26,32 +27,33 @@ class QGQuery {
     std::vector<uint8_t, memory::AlignedAllocator<uint8_t, 64>> byte_query_;
 
    public:
-    explicit QGQuery(size_t padded_dim)
+    explicit QGQuery(size_t padded_dim, size_t saq_dim = 0)
         : padded_dim_(padded_dim)
-        , lut_(padded_dim * 16)
+        , saq_dim_(saq_dim > 0 ? saq_dim : padded_dim)
+        , lut_(saq_dim_ * 16)
         , rd_query_(padded_dim)
-        , byte_query_(padded_dim) {}
+        , byte_query_(saq_dim_) {}
 
     void prepare(const float* query, const PCARotator& rotator, const QGScanner& scanner) {
         query_data_ = query;
 
-        // PCA rotate
+        // PCA rotate (full padded_dim)
         std::fill(rd_query_.begin(), rd_query_.end(), 0.0f);
         rotator.rotate(query, rd_query_.data());
 
-        // Sum of rotated query (float, exact)
+        // Sum of rotated query over SAQ dims only
         sum_q_float_ = 0;
-        for (size_t d = 0; d < padded_dim_; ++d) {
+        for (size_t d = 0; d < saq_dim_; ++d) {
             sum_q_float_ += rd_query_[d];
         }
 
-        // 4-bit quantize
+        // 4-bit quantize over SAQ dims only
         float lo, hi;
-        scalar::data_range(rd_query_.data(), padded_dim_, lo, hi);
+        scalar::data_range(rd_query_.data(), saq_dim_, lo, hi);
         width_ = (hi - lo) / ((1 << kSaqQueryBits) - 1);
         if (width_ < 1e-10f) width_ = 1e-10f;
         int32_t sumq_unused;
-        scalar::quantize(byte_query_.data(), rd_query_.data(), padded_dim_, lo, width_, sumq_unused);
+        scalar::quantize(byte_query_.data(), rd_query_.data(), saq_dim_, lo, width_, sumq_unused);
 
         vl_half_ = lo - 0.5f * width_;
 

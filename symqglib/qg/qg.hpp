@@ -43,7 +43,7 @@ class QuantizedGraph {
 
     // Search phase: PCA + 4-bit SAQ
     PCARotator pca_rotator_;
-    QuantPlan quant_plan_;
+    MixedPlan mixed_plan_;
     QGScanner scanner_;
     HashBasedBooleanSet visited_;
     buffer::SearchBuffer search_pool_;
@@ -190,10 +190,29 @@ inline void QuantizedGraph::copy_vectors(const float* data) {
 
     // PCA fit (used later in finalize_saq)
     pca_rotator_.fit(data, num_points_, dimension_);
-    constexpr float kAvgBits = 4.0f;
-    quant_plan_ = segment_dp(pca_rotator_.eigenvalues().data(), dimension_, kAvgBits);
+
+    // DP for mixed-bitwidth plan (informational only for now)
+    size_t kCodebookBudget = (dimension_ * 3 + 3) / 4;
+    kCodebookBudget = (kCodebookBudget + 3) & ~3UL;
+    mixed_plan_ = segment_dp_codebook(pca_rotator_.eigenvalues().data(), dimension_, kCodebookBudget);
+
+    // Recompute search-phase layout for reduced SAQ dims
+    size_t saq_dim = mixed_plan_.saq_dim;
+    size_t saq_fascscan_dim = saq_dim * 4;
+    size_t saq_code_floats = (degree_bound_ + kBatchSize - 1) / kBatchSize * saq_fascscan_dim * 4 / sizeof(float);
+    code_offset_ = dimension_;
+    factor_offset_ = code_offset_ + saq_code_floats;
+    neighbor_offset_ = factor_offset_ + 4 * degree_bound_;
+    assert(neighbor_offset_ + degree_bound_ <= row_offset_);
+    prefetch_lines_ = ((neighbor_offset_ + degree_bound_) * sizeof(float) + 63) / 64;
+
+    // Re-init scanner and query for reduced dims
+    scanner_ = QGScanner(saq_dim, degree_bound_);
+    query_obj_ = QGQuery(padded_dim_, saq_dim);
 
     std::cout << "\tVectors Copied, PCA Fitted\n";
+    std::cout << "\tSearch layout: saq_dim=" << saq_dim << " code_floats=" << saq_code_floats
+              << " row=" << (neighbor_offset_ + degree_bound_) << "/" << row_offset_ << " floats\n";
 }
 
 // Build-time update: RaBitQ codes + factors (baseline-compatible)
@@ -318,13 +337,15 @@ inline void QuantizedGraph::finalize_saq() {
 }
 
 inline void QuantizedGraph::encode_saq_node(PID cur_id, size_t degree) {
+    size_t saq_dim = mixed_plan_.saq_dim;
+
     std::vector<float> centroid_rot(padded_dim_, 0.0f);
     pca_rotator_.rotate(get_vector(cur_id), centroid_rot.data());
 
     std::vector<float> nb_rot(padded_dim_, 0.0f);
     std::vector<float> residual(padded_dim_, 0.0f);
-    std::vector<uint8_t> codes_4bit(padded_dim_);
-    std::vector<uint8_t> all_codes(degree * padded_dim_, 0);
+    std::vector<uint8_t> codes_4bit(saq_dim);
+    std::vector<uint8_t> all_codes(degree * saq_dim, 0);
 
     float* fac = get_saq_factor(cur_id);
     float* fac_a = fac;
@@ -341,23 +362,27 @@ inline void QuantizedGraph::encode_saq_node(PID cur_id, size_t degree) {
         for (size_t d = 0; d < padded_dim_; ++d)
             residual[d] = nb_rot[d] - centroid_rot[d];
 
+        // fac_a: exact over ALL dims (including 0-bit)
+        float r_l2sqr = 0, ip_c_r = 0;
+        for (size_t d = 0; d < padded_dim_; ++d) {
+            r_l2sqr += residual[d] * residual[d];
+            ip_c_r += centroid_rot[d] * residual[d];
+        }
+
+        // 4-bit CAQ encode only the top saq_dim PCA dims
         float o_l2sqr, delta, vmin, rescale, sum_code;
-        caq_encode_4bit(residual.data(), padded_dim_, codes_4bit.data(),
+        caq_encode_4bit(residual.data(), saq_dim, codes_4bit.data(),
             &o_l2sqr, &delta, &vmin, &rescale, &sum_code, 6);
 
-        std::memcpy(&all_codes[i * padded_dim_], codes_4bit.data(), padded_dim_);
+        std::memcpy(&all_codes[i * saq_dim], codes_4bit.data(), saq_dim);
 
-        float ip_c_r = 0;
-        for (size_t d = 0; d < padded_dim_; ++d)
-            ip_c_r += centroid_rot[d] * residual[d];
-
-        fac_a[i] = o_l2sqr + 2.0f * ip_c_r;
+        fac_a[i] = r_l2sqr + 2.0f * ip_c_r;
         fac_b[i] = -2.0f * rescale * delta;
         fac_c[i] = -2.0f * rescale * delta * sum_code;
         fac_d[i] = -2.0f * rescale * (0.5f * delta + vmin);
     }
 
-    pack_codes_4bit(padded_dim_, all_codes.data(), degree, get_saq_code(cur_id));
+    pack_codes_4bit(saq_dim, all_codes.data(), degree, get_saq_code(cur_id));
 }
 
 // Search: SAQ 4-bit fascscan
@@ -435,9 +460,9 @@ inline void QuantizedGraph::save_index(const char* filename) const {
     assert(out.is_open());
     out.write(reinterpret_cast<const char*>(&entry_point_), sizeof(PID));
     pca_rotator_.save(out);
-    size_t ps = quant_plan_.size();
+    size_t ps = mixed_plan_.segments.size();
     out.write(reinterpret_cast<const char*>(&ps), sizeof(size_t));
-    for (auto& s : quant_plan_)
+    for (auto& s : mixed_plan_.segments)
         out.write(reinterpret_cast<const char*>(&s), sizeof(QuantSegment));
     data_.save(out);
     out.close();
@@ -452,13 +477,31 @@ inline void QuantizedGraph::load_index(const char* filename) {
     pca_rotator_.load(in);
     size_t ps = 0;
     in.read(reinterpret_cast<char*>(&ps), sizeof(size_t));
-    quant_plan_.resize(ps);
-    for (auto& s : quant_plan_)
+    mixed_plan_.segments.resize(ps);
+    for (auto& s : mixed_plan_.segments)
         in.read(reinterpret_cast<char*>(&s), sizeof(QuantSegment));
+
+    // Reconstruct mixed plan from segments
+    mixed_plan_.saq_dim = 0;
+    for (auto& seg : mixed_plan_.segments)
+        if (seg.bits == 4) mixed_plan_.saq_dim += seg.dim_len;
+
+    // Recompute search layout
+    size_t saq_dim = mixed_plan_.saq_dim > 0 ? mixed_plan_.saq_dim : padded_dim_;
+    size_t saq_fascscan_dim = saq_dim * 4;
+    size_t saq_code_floats = (degree_bound_ + kBatchSize - 1) / kBatchSize * saq_fascscan_dim * 4 / sizeof(float);
+    code_offset_ = dimension_;
+    factor_offset_ = code_offset_ + saq_code_floats;
+    neighbor_offset_ = factor_offset_ + 4 * degree_bound_;
+    prefetch_lines_ = ((neighbor_offset_ + degree_bound_) * sizeof(float) + 63) / 64;
+
+    scanner_ = QGScanner(saq_dim, degree_bound_);
+    query_obj_ = QGQuery(padded_dim_, saq_dim);
+
     data_.load(in);
     in.close();
     build_phase_ = false;
-    std::cout << "Quantized graph loaded\n";
+    std::cout << "Quantized graph loaded (saq_dim=" << saq_dim << ")\n";
 }
 
 }  // namespace symqg
