@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 #include "../common.hpp"
@@ -58,6 +59,18 @@ class SearchBuffer {
             ++cur_;
         }
         return cur_id;
+    }
+
+    // get closest unchecked data point with its stored distance
+    std::pair<PID, float> pop_with_dist() {
+        PID cur_id = data_[cur_].id;
+        float cur_dist = data_[cur_].distance;
+        set_checked(data_[cur_].id);
+        ++cur_;
+        while (cur_ < size_ && is_checked(data_[cur_].id)) {
+            ++cur_;
+        }
+        return {cur_id, cur_dist};
     }
 
     void clear() {
