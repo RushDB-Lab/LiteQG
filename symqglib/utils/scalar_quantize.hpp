@@ -10,8 +10,8 @@ namespace symqg::scalar {
 
 inline void data_range(const float* __restrict__ vec, size_t dim, float& lo, float& hi) {
 #if defined(__AVX512F__)
-    __m512 max_q = _mm512_setzero_ps();
-    __m512 min_q = _mm512_setzero_ps();
+    __m512 max_q = _mm512_set1_ps(-FLT_MAX);
+    __m512 min_q = _mm512_set1_ps(FLT_MAX);
     size_t mul16 = dim - (dim & 0b1111);
     size_t i;
     for (i = 0; i < mul16; i += 16) {

@@ -120,7 +120,7 @@ class QuantizedGraph {
     void update_qg(PID, const std::vector<Candidate<float>>&);
 
     // Search: SAQ fascscan
-    void scan_neighbors(const QGQuery&, const float*, float, float*, buffer::SearchBuffer&, uint32_t) const;
+    float scan_neighbors(const QGQuery&, const float*, float, float*, buffer::SearchBuffer&, uint32_t) const;
 
    public:
     explicit QuantizedGraph(size_t, size_t, size_t);
@@ -384,11 +384,13 @@ inline void QuantizedGraph::encode_saq_node(PID cur_id, size_t degree) {
     pack_codes_4bit(saq_dim, all_codes.data(), degree, get_saq_code(cur_id));
 }
 
-// Search: SAQ 4-bit fascscan (approx-only — sqr_y from pool, no exact L2)
-inline void QuantizedGraph::scan_neighbors(
-    const QGQuery& q_obj, const float* cur_data, float sqr_y,
+// Search: SAQ 4-bit fascscan — exact L2 for sqr_y to avoid error propagation
+inline float QuantizedGraph::scan_neighbors(
+    const QGQuery& q_obj, const float* cur_data, float /*unused*/,
     float* appro_dist, buffer::SearchBuffer& pool, uint32_t cur_degree
 ) const {
+    float sqr_y = space::l2_sqr(q_obj.query_data(), cur_data, dimension_);
+
     const auto* code = reinterpret_cast<const uint8_t*>(&cur_data[code_offset_]);
     const auto* factor = &cur_data[factor_offset_];
     scanner_.scan_neighbors(
@@ -407,6 +409,7 @@ inline void QuantizedGraph::scan_neighbors(
             reinterpret_cast<const char*>(get_vector(pool.next_id())), prefetch_lines_
         );
     }
+    return sqr_y;
 }
 
 inline void QuantizedGraph::search(
@@ -425,11 +428,11 @@ inline void QuantizedGraph::search(
         auto [cur, cur_dist] = search_pool_.pop_with_dist();
         if (visited_.get(cur)) continue;
         visited_.set(cur);
-        scan_neighbors(
+        float sqr_y = scan_neighbors(
             query_obj_, get_vector(cur), cur_dist,
             appro_dist_.data(), search_pool_, degree_bound_
         );
-        res_pool.insert(cur, cur_dist);
+        res_pool.insert(cur, sqr_y);
     }
     res_pool.copy_results(results);
 }
