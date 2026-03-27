@@ -1,103 +1,100 @@
-# [SIGMOD 2025] SymphonyQG: Towards Symphonious Integration of Quantization and Graph for Approximate Nearest Neighbor Search
+# LiteQG: Lightweight Quantized Graph for Approximate Nearest Neighbor Search
 
-## Prerequisites
-* AVX512 is required
-* For details, please refer to our [technical report](https://arxiv.org/abs/2411.12229).
+A high-performance C++ library for Approximate Nearest Neighbor Search (ANNS) that combines adaptive quantization with graph-based indexing. LiteQG achieves high recall with low memory footprint through PCA-driven dimension segmentation and SIMD-accelerated distance computation.
+
+## Key Features
+
+- **Two-Segment Asymmetric Quantization (SAQ)**: Segments dimensions by PCA variance — 4-bit codes for high-variance dimensions, 1-bit sign codes for low-variance dimensions — maximizing information per bit
+- **FastScan Distance Computation**: Batch-processes 32 neighbors at once using AVX-512/AVX2 lookup tables for fast approximate distance scoring
+- **Column-Oriented PCA Rotation**: Eliminates horizontal SIMD reductions during query rotation
+- **Dynamic Quantization Planning**: DP algorithm allocates bit widths (1/2/4/8-bit) per segment to minimize quantization error under a fixed bit budget
+
+## Requirements
+
+- C++17 compiler
+- AVX-512 (recommended) or AVX2
+- OpenMP
+- Python 3.10+ (for Python bindings)
 
 ## Directory Structure
 
-    ../
-    ├── data/               # datasets and indices
-    ├── symqglib/          
-    |   ├── index/    
-    |   |   ├── fastscan/   # helper function for FastScan
-    |   |   └── qg/         # quantized graph
-    |   ├── third/          # third party dependency
-    |   └── utils/          # common utils
-    ├── python/             # python bindings
-    └── reproduce/          # code for reproduction
-
-
-## Python Bindings (recommended)
-
-### Bindings installation
-
-* Install from sources in Python env (recommended version: 3.10):
-```bash
-apt-get install -y python-setuptools python-pip
-cd python/
-pip install -r requirements.txt
-sh build.sh
+```
+├── symqglib/              # Core C++ library
+│   ├── qg/                # Quantized graph (index, builder, scanner)
+│   ├── quantization/      # SAQ, CAQ, FastScan implementations
+│   ├── space/             # Distance metrics (L2, IP)
+│   ├── utils/             # PCA, scalar quantization, IO, memory
+│   └── third/             # Third-party deps (Eigen, Faiss, SVS)
+├── python/                # Python bindings (pybind11)
+├── reproduce/             # Benchmarking and reproduction scripts
+├── test/                  # C++ test and benchmark code
+└── data/                  # Datasets (see data/README.md)
 ```
 
-### API description
+## Python Bindings (Recommended)
 
-* `symphonyqg.Index(index_type, metric, num_elements, dimension, degree_bound=32)` - intialize a non-constructed index
-  * `index_type` defines the index type, currently only support 'QG'
-  * `metric` defines the metric space, currently only support 'L2'
-  * `num_elements` defines the number of elements
-  * `dimension` defines the dimension of data vector
-  * `degree_bound` defines the maximum out-degree of graph, must be a multiple of 32
+### Installation
 
-`symphonyqg.Index` methods:
-* `build_index(data, EF, num_iter=3, num_threads=ALL_THREDS)` - construct the index from `data`
-    * `data` numpy array of vectors, `dtype=float32`, shape: `(num_elements, dimension)`
-    * `EF` a parameter that controls the number of candidates during graph construction
-    * `num_iter` number of interation for indexing, 3 by default
-    * `num_threads` number of threads for indexing, use all threads in system by default
-* `save(filename)` - save the `Index` to given path
-* `load(filename)` - load the `Index` from given path, the loaded index must have same initialization parameters as the object
-* `set_ef(EF)` - set the beam size to control time-accuracy trade-off of querying
-* `search(query, k)` - search approximate `k` nearest neighbors for a given `query` 
-    * `query` numpy array of a query vector, `dtype=float32`, shape: `(dimension,)` or `(1, dimension)`
+```bash
+cd python/
+pip install -r requirements.txt
+pip install --no-build-isolation .
+```
 
-### Example
-For examples on real-world datasets, please refer to `./reproduce`
+### API
+
 ```python
 import symphonyqg
 import numpy as np
 
-D = 64
-N = 100000
-
-# Random data
+D = 128
+N = 1000000
 data = np.random.random((N, D)).astype('float32')
 
-# Init index
+# Build index
 index = symphonyqg.Index("QG", "L2", num_elements=N, dimension=D, degree_bound=32)
+index.build_index(data, EF=200, num_iter=3)
 
-# Construct index
-index.build_index(data, 200)
-
-# Set beam size for querying
+# Query
 index.set_ef(100)
+query = data[0]
+neighbors = index.search(query, k=10)  # returns k neighbor IDs
 
-# Search query
-K = 10
-for i in range(10):
-    query = data[i]
-    knn = index.search(query, K)
-    print(knn)
+# Persistence
+index.save("my_index.bin")
 
-# Save index
-index.save("./test.index")
-del index
-
-# Load index
-index = symphonyqg.Index("QG", "L2", num_elements=N, dimension=D, degree_bound=32)
-index.load("./test.index")
+index2 = symphonyqg.Index("QG", "L2", num_elements=N, dimension=D, degree_bound=32)
+index2.load("my_index.bin")
 ```
 
+**Parameters:**
 
-## Reproduce
-* For downloading datasets and preprocessing, please refer to `./data/README.md`
-* To build index and test query performance. please refer to `./reproduce/README.md` for details
+| Parameter | Description |
+|-----------|-------------|
+| `index_type` | Index type, currently `'QG'` |
+| `metric` | Distance metric, currently `'L2'` |
+| `num_elements` | Number of vectors |
+| `dimension` | Vector dimensionality |
+| `degree_bound` | Max out-degree of graph, must be a multiple of 32 (default: 32) |
+| `EF` | Beam size — controls speed/recall trade-off for both build and search |
 
-## C++ examples
+## C++ Build
+
 ```bash
 mkdir bin/ build/
 cd build
 cmake ..
 make
 ```
-* Currently, we only add an example for indexing. The APIs will be updated later.
+
+## Datasets
+
+See [`data/README.md`](data/README.md) for dataset download and preprocessing instructions. Supported datasets include SIFT, GIST, Deep, ImageNet, and more.
+
+## Benchmarking
+
+Refer to [`reproduce/README.md`](reproduce/README.md) for instructions on building indices and evaluating query performance (QPS-recall trade-off).
+
+## Acknowledgments
+
+This project builds upon ideas from [SymphonyQG](https://arxiv.org/abs/2411.12229) and incorporates components from Faiss, Eigen, and other open-source libraries.
